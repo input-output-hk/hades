@@ -1,0 +1,198 @@
+#!/usr/bin/env bash
+# cbde — host-side launcher for the CBDE container.
+#
+# Wraps `docker run` so that day-to-day use is `cbde cabal build` instead of a
+# twelve-word command line. Two rules make the rest predictable:
+#
+#   * verbs that exist in the *in-container* cbde (ghc, cabal-version, hls,
+#     lean, list, doctor, devcontainer, update) are forwarded to it, so
+#     `cbde ghc 9.6.7` switches GHC — it does not invoke ghc with a stray arg;
+#   * anything else is a command to run inside the container, so
+#     `cbde cabal build all` builds. `cbde run <cmd>` is the explicit form.
+#
+# The project is always mounted at /workspace from the git repository root (or
+# $PWD outside a repo), with the working directory preserved, so relative paths
+# behave the same inside and outside.
+set -euo pipefail
+
+IMAGE="${CBDE_IMAGE:-cbde:latest}"
+VOLUME="${CBDE_VOLUME:-cbde-data}"
+
+die()  { printf 'cbde: %s\n' "$*" >&2; exit 1; }
+note() { printf '\033[33m%s\033[0m\n' "$*" >&2; }
+
+usage() {
+  cat <<EOF
+cbde — run the Cardano toolchain container against the current project.
+
+  cbde                        interactive shell in the container
+  cbde <cmd> [args...]        run a command   (cbde cabal build all)
+  cbde run <cmd> [args...]    same, explicit  (use when <cmd> collides below)
+  cbde nix <cmd> [args...]    run inside 'nix develop'
+
+Toolchain (forwarded to cbde inside the container):
+  cbde list                   installed and active versions
+  cbde doctor                 check this container and volume
+  cbde ghc [version]          show or switch GHC
+  cbde cabal-version [v]      show or switch cabal
+  cbde hls [version]          install the language server
+  cbde lean [toolchain]       show or switch the Lean toolchain
+  cbde devcontainer [--force] write .devcontainer/devcontainer.json here
+  cbde update                 refresh ghcup release metadata
+
+Host side:
+  cbde pull [tag]             docker pull the image
+  cbde build [docker args]    build the image from this repo
+  cbde volume [info|rm]       inspect or delete the $VOLUME volume
+  cbde info                   show what image, volume and paths resolve to
+  cbde upgrade                update the launcher and image   (not yet built)
+  cbde self-destruct          remove launcher, image, volume  (not yet built)
+  cbde help
+
+Environment:
+  CBDE_IMAGE=$IMAGE
+  CBDE_VOLUME=$VOLUME
+  CBDE_DOCKER_ARGS   extra docker run flags (e.g. '-p 8080:8080 -v ~/x:/x')
+  CBDE_GHC / CBDE_CABAL / CBDE_HLS / CBDE_LEAN   forwarded when set
+EOF
+}
+
+have_docker() { command -v docker >/dev/null 2>&1 || die "docker is not installed or not on PATH"; }
+
+project_root() {
+  git rev-parse --show-toplevel 2>/dev/null || printf '%s' "$PWD"
+}
+
+# Everything below /workspace mirrors the host layout, so a run started three
+# directories deep lands three directories deep.
+workdir_in_container() {
+  local root="$1" rel="${PWD#"$1"}"
+  rel="${rel#/}"
+  [ -n "$rel" ] && printf '/workspace/%s' "$rel" || printf '/workspace'
+}
+
+image_present() { docker image inspect "$IMAGE" >/dev/null 2>&1; }
+
+docker_run() {
+  have_docker
+  image_present || die "image $IMAGE not found — run 'cbde pull' or 'cbde build'"
+
+  local root; root="$(project_root)"
+  local wd;   wd="$(workdir_in_container "$root")"
+
+  local -a flags=(--rm)
+  [ -t 0 ] && flags+=(-i)
+  [ -t 1 ] && flags+=(-t)
+
+  local v
+  for v in CBDE_GHC CBDE_CABAL CBDE_HLS CBDE_LEAN; do
+    [ -n "${!v:-}" ] && flags+=(-e "$v=${!v}")
+  done
+
+  local -a extra=()
+  [ -n "${CBDE_DOCKER_ARGS:-}" ] && read -r -a extra <<<"$CBDE_DOCKER_ARGS"
+
+  exec docker run "${flags[@]}" \
+    -v "$VOLUME:/nix" \
+    -v "$root:/workspace" -w "$wd" \
+    "${extra[@]}" \
+    "$IMAGE" "$@"
+}
+
+cmd_volume() {
+  have_docker
+  case "${1:-info}" in
+    info|"")
+      docker volume inspect "$VOLUME" >/dev/null 2>&1 \
+        || { printf 'volume %s does not exist yet (created on first run)\n' "$VOLUME"; return 0; }
+      docker volume inspect "$VOLUME" --format \
+        'volume {{.Name}}
+  driver     {{.Driver}}
+  mountpoint {{.Mountpoint}}'
+      printf '  size       '
+      docker run --rm -v "$VOLUME:/nix" "$IMAGE" du -sh /nix 2>/dev/null | cut -f1 \
+        || printf '(unknown)\n'
+      ;;
+    rm|delete)
+      printf 'Delete volume %s? Everything cached in it (GHC, Lean, nix store,\n' "$VOLUME"
+      printf 'cabal store, package indices) is rebuilt on the next run. [y/N] '
+      local a; read -r a
+      case "$a" in y|Y|yes) docker volume rm "$VOLUME" ;; *) printf 'aborted\n' ;; esac
+      ;;
+    *) die "unknown volume subcommand: $1 (info|rm)" ;;
+  esac
+}
+
+cmd_build() {
+  have_docker
+  local here; here="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+  [ -f "$here/Dockerfile" ] || die "no Dockerfile at $here — run this from a CBDE checkout"
+  exec docker build -t "$IMAGE" "$@" "$here"
+}
+
+# Placeholders. Both are documented in the README as coming, so they explain
+# themselves and print the manual equivalent rather than failing as an unknown
+# verb (which would otherwise be run as a command inside the container).
+INSTALL_URL="https://raw.githubusercontent.com/input-output-hk/cbde/main/install.sh"
+
+cmd_upgrade() {
+  note "cbde upgrade is not implemented yet."
+  cat <<EOF
+It will: re-run the installer to refresh this launcher, then pull the current
+$IMAGE. Your $VOLUME volume is kept — the new image provisions whatever it
+newly pins on the next start.
+
+For now, by hand:
+  curl -fsSL $INSTALL_URL | sh      # once published
+  docker pull $IMAGE                     # or: cbde build, from a checkout
+
+Not to be confused with 'cbde update', which refreshes ghcup's list of
+installable toolchain versions inside the container.
+EOF
+}
+
+cmd_self_destruct() {
+  note "cbde self-destruct is not implemented yet."
+  cat <<EOF
+It will remove, after asking:
+  * this launcher ($0)
+  * the cbde:* images        (~2.3 GB of disk)
+  * the $VOLUME volume  (every cached toolchain, nix store path and
+    compiled dependency — $(docker volume inspect "$VOLUME" >/dev/null 2>&1 && printf 'currently exists' || printf 'not created yet'))
+Your projects are never touched.
+
+For now, by hand:
+  docker rmi \$(docker images 'cbde' -q) 2>/dev/null
+  docker volume rm $VOLUME
+  rm -- $0
+EOF
+}
+
+cmd_info() {
+  local root; root="$(project_root)"
+  printf 'image      %s%s\n' "$IMAGE" "$(image_present && printf '' || printf '  (not pulled)')"
+  printf 'volume     %s\n' "$VOLUME"
+  printf 'project    %s  ->  /workspace\n' "$root"
+  printf 'workdir    %s\n' "$(workdir_in_container "$root")"
+}
+
+case "${1:-shell}" in
+  shell|"")            shift || true; docker_run bash ;;
+  run|exec)            shift; [ $# -gt 0 ] || die "run: needs a command"; docker_run "$@" ;;
+  nix)                 shift; [ $# -gt 0 ] || die "nix: needs a command"; docker_run nix develop -c "$@" ;;
+
+  # Forwarded to the in-container cbde. 'cabal' alone is a tool, so the version
+  # switcher is spelled cabal-version here to keep 'cbde cabal build' working.
+  list|doctor|update|devcontainer|ghc|hls|lean)
+                       docker_run cbde "$@" ;;
+  cabal-version)       shift; docker_run cbde cabal "$@" ;;
+
+  pull)                have_docker; shift; exec docker pull "${1:-$IMAGE}" ;;
+  build)               shift; cmd_build "$@" ;;
+  volume)              shift; cmd_volume "${1:-info}" ;;
+  info)                cmd_info ;;
+  upgrade)             cmd_upgrade ;;
+  self-destruct)       cmd_self_destruct ;;
+  help|-h|--help)      usage ;;
+  *)                   docker_run "$@" ;;
+esac

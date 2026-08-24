@@ -1,0 +1,4 @@
+.git
+prompt.md
+*.md
+!README.md

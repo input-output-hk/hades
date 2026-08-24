@@ -1,0 +1,27 @@
+{
+  "//cbde-template": "dev",
+  "name": "CBDE",
+  "image": "cbde:latest",
+  "remoteUser": "cbde",
+  "updateRemoteUserUID": true,
+  "workspaceMount": "source=${localWorkspaceFolder},target=/workspace,type=bind",
+  "workspaceFolder": "/workspace",
+  "mounts": [
+    "source=cbde-data,target=/nix,type=volume"
+  ],
+  "onCreateCommand": "cbde-provision",
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "haskell.haskell",
+        "IOG.vscode-plustan",
+        "IOG.pbt-extension",
+        "leanprover.lean4",
+        "TxPipe.aiken"
+      ],
+      "settings": {
+        "plustan.binaryPath": "/usr/local/bin/plustan"
+      }
+    }
+  }
+}

@@ -1,0 +1,20 @@
+name: docker
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build CBDE image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          tags: cbde:base
+          push: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

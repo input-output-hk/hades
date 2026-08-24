@@ -1,0 +1,212 @@
+#!/usr/bin/env bash
+# CBDE toolchain provisioner.
+#
+# The image deliberately ships NO GHC and NO HLS — that was 5.6 GB of the old
+# image. They live in the persistent volume mounted at /nix, alongside the nix
+# store, the cabal store and the Lean toolchains (see README, "one volume").
+#
+# ghcup has no lazy-install hook: if GHC is not installed, `ghc` is simply not
+# on PATH. So provisioning has to be explicit. cbde-entrypoint calls this on
+# every container start; once the volume is warm it costs a few stat calls.
+#
+# Deliberately uses directory checks rather than `ghcup list` for the
+# already-installed tests: `ghcup list` fetches release metadata over the
+# network, which would make every warm start slow and offline-fragile.
+set -euo pipefail
+
+GHCUP_PREFIX="${GHCUP_INSTALL_BASE_PREFIX:-/nix/cbde}"
+GHCUP_ROOT="$GHCUP_PREFIX/.ghcup"
+GHCUP_BINDIR="$GHCUP_ROOT/bin"
+SEED_GHCUP=/opt/cbde/ghcup
+SEED_METADATA=/opt/cbde/ghcup-0.1.0.yaml
+SEED_ELAN_BIN=/opt/cbde/elan-bin
+ELAN_DIR=/nix/cbde/elan
+WARM_INDEX=/opt/cbde/warm-index
+CABAL_DIR=/nix/cbde/cabal
+STAMP=/nix/cbde/.cbde-version
+LOCK=/nix/cbde/.provision.lock
+
+log()  { printf 'cbde: %s\n' "$*" >&2; }
+warn() { printf 'cbde: WARNING: %s\n' "$*" >&2; }
+
+# Downloads here are large and hit third-party infrastructure; a single
+# transient failure should not leave a half-provisioned volume behind.
+retry() {
+  local attempt=1
+  until "$@"; do
+    [ "$attempt" -ge 3 ] && { warn "gave up after $attempt attempts: $*"; return 1; }
+    warn "attempt $attempt failed, retrying in $((attempt * 10))s: $*"
+    sleep $((attempt * 10))
+    attempt=$((attempt + 1))
+  done
+}
+
+# Is /nix backed by a mount (named volume or bind), or is it just image
+# content in the container's throwaway writable layer?
+nix_is_mounted() { awk '$2 == "/nix" { found = 1 } END { exit !found }' /proc/self/mounts; }
+
+no_volume_notice() {
+  warn "no volume is mounted at /nix."
+  warn "The Haskell toolchain (GHC/cabal/HLS) is NOT baked into this image, so"
+  warn "without a volume there is nowhere persistent to install it. Run with:"
+  warn ""
+  warn "    docker run --rm -it -v cbde-data:/nix -v \"\$PWD:/workspace\" -w /workspace \\"
+  warn "        cbde:latest bash"
+  warn ""
+  warn "Tools that need no GHC (aiken, lean, z3, nix) work fine as-is."
+}
+
+# ---------------------------------------------------------------------------
+# Volume sanity
+# ---------------------------------------------------------------------------
+if ! nix_is_mounted && [ "${CBDE_FORCE_PROVISION:-}" != "1" ]; then
+  no_volume_notice
+  exit 0
+fi
+
+if ! mkdir -p /nix/cbde 2>/dev/null; then
+  warn "/nix is not writable — cannot provision the toolchain."
+  exit 0
+fi
+
+# $CABAL_DIR MUST exist, because /root/.cabal is a symlink to it and cabal 3.10
+# picks its layout by testing whether ~/.cabal exists. A dangling symlink fails
+# that test, so cabal silently switches to the XDG layout
+# (~/.local/state/cabal, ~/.cache/cabal) — inside the container's writable
+# layer, which --rm discards. The symptom is a full index re-download and a
+# full rebuild on every single run. The image ships this directory, but a
+# volume that predates it shadows /nix and hides it, so create it here too.
+mkdir -p "$CABAL_DIR" 2>/dev/null || warn "could not create $CABAL_DIR"
+
+# Serialize: two containers (or a devcontainer plus a CLI run) sharing one
+# volume must not install into the same ghcup root concurrently.
+exec 9>"$LOCK"
+flock 9
+
+# Docker seeds an *empty* named volume from the image, but never updates a
+# volume that already has content. A volume made by an older CBDE therefore
+# keeps shadowing whatever the new image ships under /nix. GHC/cabal below are
+# self-healing; things still baked into the image (nix store, Lean) are not.
+if [ -n "${CBDE_IMAGE_VERSION:-}" ]; then
+  if [ ! -e "$STAMP" ]; then
+    printf '%s\n' "$CBDE_IMAGE_VERSION" > "$STAMP"
+  elif [ "$(cat "$STAMP")" != "$CBDE_IMAGE_VERSION" ]; then
+    warn "this volume was initialized by CBDE $(cat "$STAMP"), image is $CBDE_IMAGE_VERSION."
+    warn "GHC/cabal self-heal, but image-seeded content (nix store, Lean) does not."
+    warn "If Lean or nix misbehave: docker volume rm cbde-data  (then re-run)"
+    printf '%s\n' "$CBDE_IMAGE_VERSION" > "$STAMP"
+  fi
+fi
+
+# ---------------------------------------------------------------------------
+# ghcup itself — copied from the image, so no network and no install script
+# ---------------------------------------------------------------------------
+if [ ! -x "$GHCUP_BINDIR/ghcup" ]; then
+  log "installing ghcup into the volume"
+  mkdir -p "$GHCUP_BINDIR"
+  cp "$SEED_GHCUP" "$GHCUP_BINDIR/ghcup"
+  chmod 755 "$GHCUP_BINDIR/ghcup"
+  # ghcup re-fetches its release metadata whenever the cached copy is older
+  # than meta-cache seconds. The default 300s means nearly every container
+  # start hits the network for it; a day is plenty for a pinned toolchain.
+  ghcup config set meta-cache 86400 >/dev/null 2>&1 || true
+fi
+
+# Seed the baked metadata so a first install needs no metadata fetch at all.
+# ghcup judges freshness by mtime, so a copy made now counts as current.
+if [ -f "$SEED_METADATA" ] && [ ! -f "$GHCUP_ROOT/cache/$(basename "$SEED_METADATA")" ]; then
+  mkdir -p "$GHCUP_ROOT/cache"
+  cp "$SEED_METADATA" "$GHCUP_ROOT/cache/"
+fi
+
+ghc_installed()   { [ -d "$GHCUP_ROOT/ghc/$1" ]; }
+cabal_installed() { [ -x "$GHCUP_BINDIR/cabal-$1" ]; }
+hls_installed()   { [ -x "$GHCUP_BINDIR/haskell-language-server-wrapper-$1" ]; }
+
+first_run_banner_shown=
+banner() {
+  [ -n "$first_run_banner_shown" ] && return 0
+  first_run_banner_shown=1
+  log "───────────────────────────────────────────────────────────────"
+  log " First-time setup for this volume. This happens ONCE; every"
+  log " later container start reuses it (measured: 82s here, ~0.5s after)."
+  log "───────────────────────────────────────────────────────────────"
+}
+
+# ---------------------------------------------------------------------------
+# The pinned toolchain
+# ---------------------------------------------------------------------------
+# --set only on a fresh install: if the user switched with `cbde ghc 9.6.6`,
+# that choice must survive container restarts rather than being reset here.
+if ! ghc_installed "$CBDE_GHC"; then
+  banner
+  log "installing GHC $CBDE_GHC (~250 MB download, unpacks to ~2.6 GB)"
+  retry ghcup install ghc "$CBDE_GHC" --set
+fi
+
+if ! cabal_installed "$CBDE_CABAL"; then
+  banner
+  log "installing cabal $CBDE_CABAL"
+  retry ghcup install cabal "$CBDE_CABAL" --set
+fi
+
+# HLS is opt-in: it is the single biggest download (~2.5 GB, because one
+# bindist carries binaries for six GHC versions) and is useless in CLI mode.
+if [ -n "${CBDE_HLS:-}" ] && ! hls_installed "$CBDE_HLS"; then
+  banner
+  log "installing HLS $CBDE_HLS"
+  retry ghcup install hls "$CBDE_HLS" --set
+fi
+
+# A GHC may be installed but not selected (nothing sets it on a fresh root if
+# an install was interrupted). Make sure `ghc` resolves.
+if [ ! -e "$GHCUP_BINDIR/ghc" ] && ghc_installed "$CBDE_GHC"; then
+  ghcup set ghc "$CBDE_GHC"
+fi
+
+# ---------------------------------------------------------------------------
+# The Lean toolchain (for Blaster)
+# ---------------------------------------------------------------------------
+# CBDE_LEAN is set only in the final image, so build stages skip this. Set it
+# empty (-e CBDE_LEAN=) to skip the 2.3 GB install if you never touch Lean.
+if [ -n "${CBDE_LEAN:-}" ]; then
+  # elan's bin/ is seven hardlinks to one binary that dispatches on argv[0];
+  # copying the whole dir is what gives us `lean` and `lake`, not just `elan`.
+  if [ ! -x "$ELAN_DIR/bin/elan" ] && [ -d "$SEED_ELAN_BIN" ]; then
+    log "installing elan into the volume"
+    mkdir -p "$ELAN_DIR/bin"
+    cp -a "$SEED_ELAN_BIN/." "$ELAN_DIR/bin/"
+  fi
+  # `elan toolchain list` is local-only, so this costs nothing when warm.
+  if ! elan toolchain list 2>/dev/null | grep -qF "$CBDE_LEAN"; then
+    banner
+    log "installing Lean toolchain $CBDE_LEAN (~2.3 GB unpacked)"
+    if retry elan toolchain install "$CBDE_LEAN"; then
+      elan default "$CBDE_LEAN" >/dev/null 2>&1 || true
+    else
+      warn "Lean toolchain install failed — 'lean'/'lake' will not work."
+    fi
+  fi
+fi
+
+# ---------------------------------------------------------------------------
+# Package indices (hackage + CHaP)
+# ---------------------------------------------------------------------------
+# Previously warmed at build time, which cost the image 1.2 GB — and a second
+# 1.06 GB layer, because a later `cabal update` copy-on-writes the 982 MB
+# hackage 01-index.tar into a new layer. Warming here puts it in the volume,
+# where it was persisted anyway.
+if [ ! -f "$CABAL_DIR/packages/hackage.haskell.org/01-index.tar" ]; then
+  banner
+  log "fetching hackage + CHaP package indices (~1 GB, one time)"
+  # Run from a throwaway copy, never from $WARM_INDEX itself: cabal creates a
+  # dist-newstyle in the working directory, and the image dir is root-owned —
+  # which fails outright once the entrypoint drops us to the host user.
+  warm_tmp="$(mktemp -d)"
+  cp "$WARM_INDEX/cabal.project" "$warm_tmp/"
+  retry env -C "$warm_tmp" cabal update
+  rm -rf "$warm_tmp"
+fi
+
+[ -n "$first_run_banner_shown" ] && log "first-time setup complete."
+exit 0

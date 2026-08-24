@@ -1,0 +1,103 @@
+#!/usr/bin/env bash
+# CBDE container entrypoint.
+#
+# Two jobs, in order:
+#   1. adopt the host user's uid/gid, so nothing the container writes into a
+#      bind-mounted project comes out owned by root;
+#   2. make sure the persistent volume holds the pinned toolchains.
+#
+# Provisioning failures are non-fatal on purpose: a user with no network should
+# still get their shell, and every tool that needs no GHC still works.
+set -uo pipefail
+
+log()  { printf 'cbde: %s\n' "$*" >&2; }
+warn() { printf 'cbde: WARNING: %s\n' "$*" >&2; }
+
+# ---------------------------------------------------------------------------
+# Run as the host user, not as root
+# ---------------------------------------------------------------------------
+# One published image serves every uid: the uid is discovered at run time, never
+# baked in. The container starts as root, adopts the uid that owns the mounted
+# project, and drops privileges before running the requested command. Without
+# this, dist-newstyle, .hie, aiken's build/ and .lake all come out root-owned in
+# the user's own working tree, and they cannot delete them.
+#
+# `--user` on the docker command line also works now that the image is prepared
+# for it, but only the automatic path needs nothing from the user.
+#
+# CBDE_DROPPED marks the re-exec so the second pass skips this block.
+if [ -z "${CBDE_DROPPED:-}" ] && [ "$(id -u)" = 0 ]; then
+  target_uid="${CBDE_UID:-}"
+  target_gid="${CBDE_GID:-}"
+
+  # Whoever owns the mounted project is who we should be. /workspace is the
+  # documented mount point; $PWD covers a project mounted somewhere else with
+  # -w. A root-owned directory means no bind mount (or a platform where
+  # ownership is virtualised, e.g. Docker Desktop) — stay root, nothing to fix.
+  if [ -z "$target_uid" ]; then
+    for candidate in /workspace "$PWD"; do
+      [ -d "$candidate" ] || continue
+      c_uid="$(stat -c %u "$candidate" 2>/dev/null || echo 0)"
+      if [ "$c_uid" != 0 ]; then
+        target_uid="$c_uid"
+        target_gid="$(stat -c %g "$candidate" 2>/dev/null || echo "$c_uid")"
+        break
+      fi
+    done
+  fi
+
+  if [ -n "$target_uid" ] && [ "$target_uid" != 0 ]; then
+    target_gid="${target_gid:-$target_uid}"
+
+    # The image ships a `cbde` user; point it at the host's ids. -o allows a
+    # collision with an id that already exists in the image.
+    if [ "$(id -u cbde 2>/dev/null)" != "$target_uid" ]; then
+      groupmod -o -g "$target_gid" cbde >/dev/null 2>&1 || true
+      usermod -o -u "$target_uid" -g "$target_gid" cbde >/dev/null 2>&1 \
+        || warn "could not set the cbde user to $target_uid:$target_gid"
+    fi
+
+    # HOME stays /root for root and for cbde alike. That is deliberate: it
+    # keeps ~/.cabal and ~/.elan — and therefore cabal's legacy store layout
+    # and the exact toolchain path /opt/blaster was built against — identical
+    # no matter who is running. It holds symlinks and configs, so this is cheap.
+    chown -R "$target_uid:$target_gid" /root 2>/dev/null || true
+
+    # The volume: tens of thousands of files, so do it once per (volume, user)
+    # and record it. Runs before provisioning, so anything installed afterwards
+    # is created owned by the user in the first place.
+    # Only when /nix is a real volume. Over plain image content, chown -R
+    # forces an overlayfs copy-up of the entire 2.8 GB layer on every run, and
+    # nothing written there would persist anyway.
+    if awk '$2 == "/nix" { f = 1 } END { exit !f }' /proc/self/mounts \
+       && mkdir -p /nix/cbde 2>/dev/null; then
+      owner_stamp=/nix/cbde/.cbde-owner
+      if [ "$(cat "$owner_stamp" 2>/dev/null)" != "$target_uid:$target_gid" ]; then
+        log "handing /nix to uid $target_uid:$target_gid — once for this volume, may take a minute"
+        if chown -R "$target_uid:$target_gid" /nix 2>/dev/null; then
+          printf '%s\n' "$target_uid:$target_gid" > "$owner_stamp"
+          chown "$target_uid:$target_gid" "$owner_stamp" 2>/dev/null || true
+        else
+          warn "could not take ownership of /nix; the toolchain may not be writable."
+        fi
+      fi
+    fi
+
+    exec setpriv --reuid "$target_uid" --regid "$target_gid" --init-groups \
+         env CBDE_DROPPED=1 HOME=/root "$0" "$@"
+  fi
+fi
+
+# If the user supplied --user themselves, we never had the privileges to fix
+# ownership. Say so plainly rather than failing deep inside cabal.
+if [ "$(id -u)" != 0 ] && [ -z "${CBDE_DROPPED:-}" ] && [ -d /nix ] && [ ! -w /nix ]; then
+  warn "running as uid $(id -u), but /nix is not writable by that user."
+  warn "Drop --user and let the entrypoint adopt your uid automatically, or run"
+  warn "once as root so it can take ownership of the volume."
+fi
+
+if [ "${CBDE_SKIP_PROVISION:-}" != "1" ]; then
+  cbde-provision || warn "toolchain provisioning failed; continuing."
+fi
+
+exec "$@"
