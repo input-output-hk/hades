@@ -3,18 +3,99 @@ name: docker
 on:
   push:
     branches: [main]
+  pull_request:
   workflow_dispatch:
+
+# Multi-arch image, each platform built natively (emulating a GHC toolchain
+# build takes hours). The arm64 job needs an arm64 runner: `ubuntu-24.04-arm`
+# is GitHub-hosted and free for public repos; a private repo needs a larger
+# runner or a self-hosted arm64 runner with that label.
+env:
+  IMAGE: ghcr.io/${{ github.repository_owner }}/cbde
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-latest
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      version: ${{ steps.version.outputs.version }}
     steps:
       - uses: actions/checkout@v4
-      - name: Build CBDE image
+
+      # The version tag comes from the Dockerfile so that the image, the volume
+      # stamp and the devcontainer template all agree on one number.
+      - name: Read image version
+        id: version
+        run: |
+          v="$(sed -n 's/^ARG CBDE_IMAGE_VERSION=//p' Dockerfile | head -1)"
+          [ -n "$v" ] || { echo "CBDE_IMAGE_VERSION not found in Dockerfile" >&2; exit 1; }
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "arch=${{ matrix.platform }}" | tr / - | sed 's/linux-//' >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Pushed by digest only; the manifest job below gives the pair its tags.
+      - name: Build (and publish) CBDE image
+        id: build
         uses: docker/build-push-action@v6
         with:
           context: .
-          tags: cbde:base
-          push: false
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          platforms: ${{ matrix.platform }}
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=${{ github.event_name != 'pull_request' }}
+          cache-from: type=gha,scope=${{ matrix.platform }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.platform }}
+
+      - name: Export digest
+        if: github.event_name != 'pull_request'
+        run: |
+          mkdir -p /tmp/digests
+          touch "/tmp/digests/${{ steps.build.outputs.digest }}"
+      - uses: actions/upload-artifact@v4
+        if: github.event_name != 'pull_request'
+        with:
+          name: digest-${{ steps.version.outputs.arch }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  manifest:
+    needs: build
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: digest-*
+          merge-multiple: true
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Create multi-arch manifest
+        working-directory: /tmp/digests
+        run: |
+          docker buildx imagetools create \
+            -t "$IMAGE:${{ needs.build.outputs.version }}" \
+            -t "$IMAGE:latest" \
+            $(printf "$IMAGE@sha256:%s " *)
+          docker buildx imagetools inspect "$IMAGE:latest"

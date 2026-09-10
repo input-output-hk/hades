@@ -13,16 +13,32 @@
 # The project is always mounted at /workspace from the git repository root (or
 # $PWD outside a repo), with the working directory preserved, so relative paths
 # behave the same inside and outside.
+#
+# Portability: this runs under macOS's stock bash 3.2 as well as Linux bash 5,
+# so no associative arrays, no ${var,,}, and empty arrays are expanded with the
+# ${arr[@]+"${arr[@]}"} idiom (bash < 4.4 treats "${arr[@]}" of an empty array
+# as an unbound variable under set -u).
 set -euo pipefail
 
 IMAGE="${CBDE_IMAGE:-cbde:latest}"
 VOLUME="${CBDE_VOLUME:-cbde-data}"
+# The image is multi-arch (amd64, arm64) and Docker picks the host's native one.
+# CBDE_PLATFORM forces another, e.g. linux/amd64 on an Apple Silicon Mac to run
+# the x86_64 image under Rosetta; normally unset.
+PLATFORM="${CBDE_PLATFORM:-}"
+# Where `cbde pull` fetches from. The image keeps its short local name
+# ($IMAGE) so the devcontainer template and every docker command in the README
+# stay valid whichever registry it came from.
+REGISTRY="${CBDE_REGISTRY:-ghcr.io/input-output-hk/cbde}"
+
+HOST_OS="$(uname -s)"
+HOST_ARCH="$(uname -m)"
 
 die()  { printf 'cbde: %s\n' "$*" >&2; exit 1; }
 note() { printf '\033[33m%s\033[0m\n' "$*" >&2; }
 
 usage() {
-  cat <<EOF
+  cat <<USAGE
 cbde — run the Cardano toolchain container against the current project.
 
   cbde                        interactive shell in the container
@@ -32,7 +48,7 @@ cbde — run the Cardano toolchain container against the current project.
 
 Toolchain (forwarded to cbde inside the container):
   cbde list                   installed and active versions
-  cbde doctor                 check this container and volume
+  cbde doctor                 check this container, volume and platform
   cbde ghc [version]          show or switch GHC
   cbde cabal-version [v]      show or switch cabal
   cbde hls [version]          install the language server
@@ -41,10 +57,10 @@ Toolchain (forwarded to cbde inside the container):
   cbde update                 refresh ghcup release metadata
 
 Host side:
-  cbde pull [tag]             docker pull the image
-  cbde build [docker args]    build the image from this repo
+  cbde pull [tag]             pull $REGISTRY:<tag> and name it $IMAGE
+  cbde build [docker args]    build the image from this repo (native arch)
   cbde volume [info|rm]       inspect or delete the $VOLUME volume
-  cbde info                   show what image, volume and paths resolve to
+  cbde info                   show what image, volume, platform and paths resolve to
   cbde upgrade                update the launcher and image   (not yet built)
   cbde self-destruct          remove launcher, image, volume  (not yet built)
   cbde help
@@ -52,21 +68,31 @@ Host side:
 Environment:
   CBDE_IMAGE=$IMAGE
   CBDE_VOLUME=$VOLUME
+  CBDE_PLATFORM=${PLATFORM:-(native)}
+  CBDE_REGISTRY=$REGISTRY
   CBDE_DOCKER_ARGS   extra docker run flags (e.g. '-p 8080:8080 -v ~/x:/x')
   CBDE_GHC / CBDE_CABAL / CBDE_HLS / CBDE_LEAN   forwarded when set
-EOF
+USAGE
 }
 
 have_docker() { command -v docker >/dev/null 2>&1 || die "docker is not installed or not on PATH"; }
 
+# Physical paths throughout. git already resolves symlinks in --show-toplevel;
+# $PWD does not, so on macOS (/tmp -> /private/tmp, /var -> /private/var, a
+# home on an external volume) the two disagree and the relative part below
+# comes out wrong.
+physical_pwd() { pwd -P; }
+
 project_root() {
-  git rev-parse --show-toplevel 2>/dev/null || printf '%s' "$PWD"
+  git rev-parse --show-toplevel 2>/dev/null || physical_pwd
 }
 
 # Everything below /workspace mirrors the host layout, so a run started three
 # directories deep lands three directories deep.
 workdir_in_container() {
-  local root="$1" rel="${PWD#"$1"}"
+  local root="$1" here rel
+  here="$(physical_pwd)"
+  rel="${here#"$root"}"
   rel="${rel#/}"
   [ -n "$rel" ] && printf '/workspace/%s' "$rel" || printf '/workspace'
 }
@@ -80,22 +106,27 @@ docker_run() {
   local root; root="$(project_root)"
   local wd;   wd="$(workdir_in_container "$root")"
 
-  local -a flags=(--rm)
+  local flags=(--rm)
+  [ -n "$PLATFORM" ] && flags+=(--platform "$PLATFORM")
   [ -t 0 ] && flags+=(-i)
   [ -t 1 ] && flags+=(-t)
+
+  # Lets `cbde doctor` inside tell emulated from native: the container only
+  # sees the architecture it was built for.
+  flags+=(-e "CBDE_HOST_OS=$HOST_OS" -e "CBDE_HOST_ARCH=$HOST_ARCH")
 
   local v
   for v in CBDE_GHC CBDE_CABAL CBDE_HLS CBDE_LEAN; do
     [ -n "${!v:-}" ] && flags+=(-e "$v=${!v}")
   done
 
-  local -a extra=()
+  local extra=()
   [ -n "${CBDE_DOCKER_ARGS:-}" ] && read -r -a extra <<<"$CBDE_DOCKER_ARGS"
 
   exec docker run "${flags[@]}" \
     -v "$VOLUME:/nix" \
     -v "$root:/workspace" -w "$wd" \
-    "${extra[@]}" \
+    ${extra[@]+"${extra[@]}"} \
     "$IMAGE" "$@"
 }
 
@@ -109,9 +140,16 @@ cmd_volume() {
         'volume {{.Name}}
   driver     {{.Driver}}
   mountpoint {{.Mountpoint}}'
+      # The mountpoint is a path inside Docker's Linux VM, not on the Mac.
+      [ "$HOST_OS" = Darwin ] && printf '             (inside the Docker VM — this path does not exist on macOS)\n'
       printf '  size       '
-      docker run --rm -v "$VOLUME:/nix" "$IMAGE" du -sh /nix 2>/dev/null | cut -f1 \
-        || printf '(unknown)\n'
+      if image_present; then
+        docker run --rm ${PLATFORM:+--platform "$PLATFORM"} -e CBDE_SKIP_PROVISION=1 \
+          -v "$VOLUME:/nix" "$IMAGE" du -sh /nix 2>/dev/null | cut -f1 \
+          || printf '(unknown)\n'
+      else
+        printf '(unknown — image %s not present)\n' "$IMAGE"
+      fi
       ;;
     rm|delete)
       printf 'Delete volume %s? Everything cached in it (GHC, Lean, nix store,\n' "$VOLUME"
@@ -123,11 +161,30 @@ cmd_volume() {
   esac
 }
 
+# `cbde pull [tag]` fetches from the registry and gives the result the local
+# name everything else uses. A ref containing a slash is taken verbatim, so
+# `cbde pull ghcr.io/someone/cbde:dev` works for forks.
+cmd_pull() {
+  have_docker
+  local ref="${1:-latest}"
+  case "$ref" in
+    */*) ;;
+    *)   ref="$REGISTRY:$ref" ;;
+  esac
+  docker pull ${PLATFORM:+--platform "$PLATFORM"} "$ref"
+  [ "$ref" = "$IMAGE" ] || docker tag "$ref" "$IMAGE"
+  printf 'cbde: %s is now %s\n' "$ref" "$IMAGE" >&2
+}
+
 cmd_build() {
   have_docker
-  local here; here="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+  local here; here="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
   [ -f "$here/Dockerfile" ] || die "no Dockerfile at $here — run this from a CBDE checkout"
-  exec docker build -t "$IMAGE" "$@" "$here"
+  # Native by default. Cross-building (CBDE_PLATFORM set) goes through the
+  # runtime's emulator and takes hours; the published multi-arch image is the
+  # way to get the other architecture.
+  [ -n "$PLATFORM" ] && note "cbde build: building $PLATFORM on $HOST_ARCH — emulated, expect hours"
+  exec docker build ${PLATFORM:+--platform "$PLATFORM"} -t "$IMAGE" "$@" "$here"
 }
 
 # Placeholders. Both are documented in the README as coming, so they explain
@@ -137,23 +194,23 @@ INSTALL_URL="https://raw.githubusercontent.com/input-output-hk/cbde/main/install
 
 cmd_upgrade() {
   note "cbde upgrade is not implemented yet."
-  cat <<EOF
+  cat <<EOU
 It will: re-run the installer to refresh this launcher, then pull the current
 $IMAGE. Your $VOLUME volume is kept — the new image provisions whatever it
 newly pins on the next start.
 
 For now, by hand:
   curl -fsSL $INSTALL_URL | sh      # once published
-  docker pull $IMAGE                     # or: cbde build, from a checkout
+  cbde pull                              # or: cbde build, from a checkout
 
 Not to be confused with 'cbde update', which refreshes ghcup's list of
 installable toolchain versions inside the container.
-EOF
+EOU
 }
 
 cmd_self_destruct() {
   note "cbde self-destruct is not implemented yet."
-  cat <<EOF
+  cat <<EOS
 It will remove, after asking:
   * this launcher ($0)
   * the cbde:* images        (~2.3 GB of disk)
@@ -165,13 +222,15 @@ For now, by hand:
   docker rmi \$(docker images 'cbde' -q) 2>/dev/null
   docker volume rm $VOLUME
   rm -- $0
-EOF
+EOS
 }
 
 cmd_info() {
   local root; root="$(project_root)"
   printf 'image      %s%s\n' "$IMAGE" "$(image_present && printf '' || printf '  (not pulled)')"
+  printf 'registry   %s\n' "$REGISTRY"
   printf 'volume     %s\n' "$VOLUME"
+  printf 'platform   %s  (host: %s %s)\n' "${PLATFORM:-native}" "$HOST_OS" "$HOST_ARCH"
   printf 'project    %s  ->  /workspace\n' "$root"
   printf 'workdir    %s\n' "$(workdir_in_container "$root")"
 }
@@ -187,7 +246,7 @@ case "${1:-shell}" in
                        docker_run cbde "$@" ;;
   cabal-version)       shift; docker_run cbde cabal "$@" ;;
 
-  pull)                have_docker; shift; exec docker pull "${1:-$IMAGE}" ;;
+  pull)                shift; cmd_pull "${1:-}" ;;
   build)               shift; cmd_build "$@" ;;
   volume)              shift; cmd_volume "${1:-info}" ;;
   info)                cmd_info ;;

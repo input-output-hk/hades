@@ -238,8 +238,107 @@ cmd_list() {
   printf '\n'
 }
 
+# Emulation is invisible from inside: uname reports the architecture the image
+# was built for. Two tells remain. Rosetta maps its runtime into every process
+# (/proc/self/maps mentions "rosetta"); QEMU user-mode does not, but the kernel's
+# /proc/cpuinfo is not emulated, so an ARM cpuinfo under an x86_64 uname means
+# some emulator is in the way. The launcher also passes the host's uname.
+emulator() {
+  if grep -qi rosetta /proc/self/maps 2>/dev/null; then
+    printf 'rosetta'
+  elif grep -q '^CPU implementer' /proc/cpuinfo 2>/dev/null \
+       || case "${CBDE_HOST_ARCH:-}" in arm64|aarch64) true ;; *) false ;; esac; then
+    printf 'qemu'
+  else
+    printf 'none'
+  fi
+}
+
+# Can this (aarch64) container execute x86_64 binaries? That is what makes
+# `nix develop --system x86_64-linux` usable — IOG's caches publish x86_64-linux
+# only — and it depends on the Docker VM having a binfmt handler (Rosetta).
+# The probe is a 132-byte static x86_64 ELF that does exit(42); "exec format
+# error" (126) means no handler.
+x86_64_runs_here() {
+  local probe; probe="$(mktemp)" || return 1
+  printf '\x7fELF\x02\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02\x00\x3e\x00\x01\x00\x00\x00\x78\x00\x40\x00\x00\x00\x00\x00\x40\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x40\x00\x38\x00\x01\x00\x00\x00\x00\x00\x00\x00\x01\x00\x00\x00\x05\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x40\x00\x00\x00\x00\x00\x00\x00\x40\x00\x00\x00\x00\x00\x84\x00\x00\x00\x00\x00\x00\x00\x84\x00\x00\x00\x00\x00\x00\x00\x00\x10\x00\x00\x00\x00\x00\x00\xbf\x2a\x00\x00\x00\xb8\x3c\x00\x00\x00\x0f\x05' > "$probe"
+  chmod 700 "$probe"
+  "$probe" 2>/dev/null
+  local rc=$?
+  rm -f "$probe"
+  [ "$rc" = 42 ]
+}
+
+# Memory the container may actually use: the cgroup limit if there is one,
+# else everything the (virtual) machine has.
+memory_mib() {
+  local lim
+  lim="$(cat /sys/fs/cgroup/memory.max 2>/dev/null \
+         || cat /sys/fs/cgroup/memory/memory.limit_in_bytes 2>/dev/null || echo max)"
+  if [ "$lim" != max ] && [ "$lim" -lt 1000000000000 ] 2>/dev/null; then
+    printf '%d' "$((lim / 1048576))"
+  else
+    awk '/^MemTotal:/ { printf "%d", $2 / 1024 }' /proc/meminfo
+  fi
+}
+
+rosetta_hints() {
+  note "  Docker Desktop: Settings > General > 'Use Rosetta for x86_64/amd64 emulation on Apple Silicon'"
+  note "  Colima:         colima stop && colima start --vm-type vz --vz-rosetta"
+  note "  OrbStack:       on by default (check Settings > System)"
+}
+
+doctor_platform() {
+  local arch host cpus mem fail=0
+  arch="$(uname -m)"
+  host="${CBDE_HOST_OS:-?} ${CBDE_HOST_ARCH:-?}"
+  cpus="$(nproc 2>/dev/null || echo '?')"
+  mem="$(memory_mib)"
+  printf '  container: linux/%s    host: %s\n' "$arch" "$host"
+
+  case "$arch" in
+    aarch64)
+      ok "native aarch64 — GHC, cabal, plustan, aiken, lean and nix run at full speed"
+      if x86_64_runs_here; then
+        ok "x86_64 binaries run here too (Rosetta) — 'nix develop --system x86_64-linux' can use the IOG caches"
+      else
+        note "x86_64 binaries cannot run here, so 'nix --system x86_64-linux' (IOG caches) is unavailable;"
+        note "everything native still works. To enable it, turn on Rosetta in the Docker runtime and restart it:"
+        rosetta_hints
+      fi
+      ;;
+    x86_64)
+      case "$(emulator)" in
+        none)    ok "native x86_64" ;;
+        rosetta) note "x86_64 image under Rosetta on an arm64 host: works, ~2-3x slower than the native arm64 image (unset CBDE_PLATFORM)" ;;
+        qemu)
+          bad "x86_64 image under QEMU — very slow, and GHC is known to misbehave; use the native image (unset CBDE_PLATFORM) or enable Rosetta:"
+          rosetta_hints
+          fail=1
+          ;;
+      esac
+      ;;
+    *) note "unexpected architecture $arch" ;;
+  esac
+
+  printf '  %s CPUs, %s MiB memory available to this container\n' "$cpus" "$mem"
+  if [ "$cpus" -lt 4 ] 2>/dev/null; then
+    note "fewer than 4 CPUs — cabal builds of plutus projects will crawl"
+    [ "${CBDE_HOST_OS:-}" = Darwin ] && note "give the Docker VM more: Docker Desktop > Settings > Resources; Colima: colima start --cpu 8"
+  fi
+  if [ "$mem" -lt 8000 ] 2>/dev/null; then
+    bad "less than 8 GB memory — GHC on plutus-tx dependencies gets OOM-killed below that (16 GB for plutus-tx-plugin modules)"
+    [ "${CBDE_HOST_OS:-}" = Darwin ] && note "raise the Docker VM's memory: Docker Desktop > Settings > Resources; Colima: colima start --memory 16"
+    fail=1
+  fi
+  return "$fail"
+}
+
 cmd_doctor() {
   local fail=0
+  hdr "Platform"
+  doctor_platform || fail=1
+
   hdr "Persistence"
   if nix_is_mounted; then
     ok "volume mounted at /nix"
@@ -295,6 +394,11 @@ cmd_doctor() {
       ok "/workspace is owned by us — files created here will be yours on the host"
     elif [ "$(id -u)" = 0 ] && [ "$w_uid" = 0 ]; then
       note "/workspace is not a bind mount (or ownership is virtualised)"
+    elif [ "$w_uid" = 0 ] && [ -w /workspace ]; then
+      # Docker Desktop / Colima: the mount looks like root's to us, but the
+      # runtime maps every write back to the host user. The entrypoint put us
+      # on the image's cbde uid so the volume and the devcontainer agree.
+      ok "/workspace ownership is virtualised by the Docker runtime — new files are yours on the host"
     else
       bad "/workspace is owned by uid $w_uid but we run as $(id -u) — new files get the wrong owner"
       fail=1
