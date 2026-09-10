@@ -76,6 +76,18 @@ FROM ubuntu:24.04 AS base
 
 ARG DEBIAN_FRONTEND=noninteractive
 
+# A non-root user for the runtime. HOME is deliberately /root, not /home/cbde:
+# that keeps ~/.cabal and ~/.elan — and therefore cabal's legacy store layout
+# and the exact toolchain path /opt/blaster's .lake artifacts were built
+# against — identical whichever user ends up running. cbde-entrypoint retargets
+# this user's uid/gid to whoever owns the mounted project at run time, so one
+# published image serves every host uid. Created this early so that /nix can
+# be handed to it in the same layer that populates it (below).
+# Ubuntu 24.04 ships an `ubuntu` user on uid 1000; we need that id free.
+RUN userdel -r ubuntu >/dev/null 2>&1 || true; \
+    groupadd -g 1000 cbde \
+    && useradd -u 1000 -g 1000 -M -d /root -s /bin/bash cbde
+
 # Cardano crypto libs (runtime .so + headers + pkg-config).
 COPY --from=crypto-builder /usr/local /usr/local
 RUN ldconfig
@@ -96,9 +108,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # The bootstrap script installs a GHC (and tests BOOTSTRAP_HASKELL_INSTALL_HLS
 # with `[ -n ... ]`, so even `=0` installs HLS — 2.5 GB by accident). We want
 # neither in the image: cbde-provision installs them into the volume.
+# The image is multi-arch: amd64 for x86_64 hosts, arm64 for Apple Silicon and
+# other aarch64 hosts, each built natively. TARGETARCH is BuildKit's name for
+# the platform being built; upstream download URLs use uname-style names.
+ARG TARGETARCH
 ARG GHCUP_VERSION
-RUN curl -fsSL -o /opt/cbde-ghcup \
-      "https://downloads.haskell.org/~ghcup/${GHCUP_VERSION}/x86_64-linux-ghcup-${GHCUP_VERSION}" \
+RUN case "$TARGETARCH" in amd64) m=x86_64 ;; arm64) m=aarch64 ;; *) echo "unsupported TARGETARCH: $TARGETARCH" >&2; exit 1 ;; esac \
+    && curl -fsSL -o /opt/cbde-ghcup \
+      "https://downloads.haskell.org/~ghcup/${GHCUP_VERSION}/${m}-linux-ghcup-${GHCUP_VERSION}" \
     && install -Dm755 /opt/cbde-ghcup /opt/cbde/ghcup && rm /opt/cbde-ghcup \
     && /opt/cbde/ghcup --version \
     # Bake ghcup's release metadata (663 KB) so the first provision needs no
@@ -123,6 +140,17 @@ ENV GHCUP_INSTALL_BASE_PREFIX=/nix/cbde \
 
 # Nix (single-user, no daemon — containers have no systemd).
 # sandbox=false: nix sandboxing needs privileges most containers don't have.
+# filter-syscalls=false: Nix wraps builds in a seccomp BPF filter that Rosetta
+# cannot load ("unable to load seccomp BPF program: Invalid argument"). It
+# matters for x86_64 builds run under Rosetta (see extra-platforms below); the
+# filter only blocks setuid/setgid bits inside builds, which the disabled
+# sandbox already leaves unenforced, so nothing is lost natively.
+# extra-platforms (arm64 image only): Nix runs natively as aarch64-linux, but
+# IOG's binary caches publish x86_64-linux, not aarch64-linux. A project that
+# needs them runs `nix develop --system x86_64-linux`: the closure is
+# substituted from the cache and executed through the VM's Rosetta binfmt
+# (Colima --vz-rosetta, Docker Desktop's Rosetta setting, OrbStack default).
+# `cbde doctor` reports whether that works in the current container.
 # NOTE: /nix must stay a REAL directory (Nix refuses a symlinked store path),
 # so the single-volume layout puts the OTHER caches inside /nix instead.
 RUN mkdir -m 0755 /nix \
@@ -130,13 +158,22 @@ RUN mkdir -m 0755 /nix \
     && { \
          echo 'experimental-features = nix-command flakes'; \
          echo 'sandbox = false'; \
+         echo 'filter-syscalls = false'; \
          echo 'build-users-group ='; \
          echo 'extra-substituters = https://cache.iog.io https://sc-testing-tools.cachix.org'; \
          echo 'extra-trusted-public-keys = hydra.iohk.io:f/Ea+s+dFdN+3Y/G+FDgSq+a5NEWhJGzdjvKNGv0/EQ= sc-testing-tools.cachix.org-1:EdJM0ldUx5PeP16xc1fjZ5oCGgryZJxf/Q1MHQ40M8s='; \
          echo 'accept-flake-config = true'; \
        } > /etc/nix/nix.conf \
+    && if [ "$TARGETARCH" = arm64 ]; then \
+         echo 'extra-platforms = x86_64-linux aarch64-linux' >> /etc/nix/nix.conf; \
+       fi \
     && curl -L https://nixos.org/nix/install | sh -s -- --no-daemon \
-    && /root/.nix-profile/bin/nix --version
+    && /root/.nix-profile/bin/nix --version \
+    # Owned by the cbde user from the start, and in this same layer: a named
+    # volume is seeded from the image, so this is what makes a fresh volume
+    # writable by uid 1000 without the entrypoint — which VS Code's dev
+    # container mode does not run (its onCreateCommand runs as `cbde`).
+    && chown -R cbde:cbde /nix
 ENV PATH=/root/.nix-profile/bin:$PATH
 
 # pkg-config must see /usr/local (blst, libsodium, secp256k1).
@@ -145,7 +182,7 @@ ENV PKG_CONFIG_PATH=/usr/local/lib/pkgconfig
 # cabal's store must land in the volume. /root/.cabal has to EXIST (as a
 # symlink is fine) before cabal first runs: its presence is what makes cabal
 # 3.10 choose the legacy layout (~/.cabal/store) over ~/.local/state/cabal.
-RUN mkdir -p /nix/cbde/cabal && ln -s /nix/cbde/cabal /root/.cabal
+RUN mkdir -p /nix/cbde/cabal && chown -R cbde:cbde /nix/cbde && ln -s /nix/cbde/cabal /root/.cabal
 
 # Repository stanza used only to warm the CHaP index (projects declare their
 # own). Kept out of ~/.cabal/config so we never fight a project's cabal.project.
@@ -209,10 +246,12 @@ RUN --mount=type=cache,target=/nix/cbde/cabal/store,sharing=locked \
 FROM base AS aiken-dl
 
 ARG AIKEN_VERSION=v1.1.23
-RUN curl -fsSL \
-      "https://github.com/aiken-lang/aiken/releases/download/${AIKEN_VERSION}/aiken-x86_64-unknown-linux-musl.tar.gz" \
+ARG TARGETARCH
+RUN case "$TARGETARCH" in amd64) t=x86_64-unknown-linux-musl ;; arm64) t=aarch64-unknown-linux-musl ;; *) exit 1 ;; esac \
+    && curl -fsSL \
+      "https://github.com/aiken-lang/aiken/releases/download/${AIKEN_VERSION}/aiken-${t}.tar.gz" \
       | tar -xz -C /tmp \
-    && install -Dm755 /tmp/aiken-x86_64-unknown-linux-musl/aiken /out/aiken \
+    && install -Dm755 "/tmp/aiken-${t}/aiken" /out/aiken \
     && /out/aiken --version
 
 # ---------------------------------------------------------------------------
@@ -259,17 +298,7 @@ FROM base AS final
 # which shell out to libgit2) operate on them regardless.
 RUN git config --system --add safe.directory '*'
 
-# A non-root user for the runtime. HOME is deliberately /root, not /home/cbde:
-# that keeps ~/.cabal and ~/.elan — and therefore cabal's legacy store layout
-# and the exact toolchain path /opt/blaster's .lake artifacts were built
-# against — identical whichever user ends up running. cbde-entrypoint retargets
-# this user's uid/gid to whoever owns the mounted project at run time, so one
-# published image serves every host uid.
-# Ubuntu 24.04 ships an `ubuntu` user on uid 1000; we need that id free.
-RUN userdel -r ubuntu >/dev/null 2>&1 || true; \
-    groupadd -g 1000 cbde \
-    && useradd -u 1000 -g 1000 -M -d /root -s /bin/bash cbde
-
+# The `cbde` runtime user is created in the base stage (it owns /nix there).
 COPY cbde-provision cbde-entrypoint cbde /usr/local/bin/
 
 # The devcontainer template, so `cbde devcontainer` can drop it into a project
@@ -305,7 +334,7 @@ COPY --from=blaster-builder /usr/local/bin/z3 /usr/local/bin/z3
 COPY --from=blaster-builder /usr/local/lib/libz3.so* /usr/local/lib/
 COPY --from=blaster-builder /usr/local/include/z3* /usr/local/include/
 COPY --from=blaster-builder /opt/blaster /opt/blaster
-RUN ldconfig && mkdir -p /nix/cbde/elan && ln -s /nix/cbde/elan /root/.elan
+RUN ldconfig && mkdir -p /nix/cbde/elan && chown cbde:cbde /nix/cbde/elan && ln -s /nix/cbde/elan /root/.elan
 ENV PATH=/root/.elan/bin:$PATH
 
 # Single-volume layout: the user mounts ONE named volume at /nix and Docker

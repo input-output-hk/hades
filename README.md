@@ -19,7 +19,7 @@ Those run in the container against the project in your current directory. No
 - **[What's in the box](#whats-in-the-box)** — every pinned version
 - **[The tools, one by one](#the-tools-one-by-one)** — Haskell/Plinth · plustan · Aiken · Blaster · Nix · PBT
 - **[Switching versions](#switching-toolchain-versions)** · **[VS Code](#vs-code-dev-containers)** · **[Your own user](#running-as-your-own-user)**
-- **[Updating and removing](#updating-and-removing)** · **[Gotchas](#gotchas)** · **[Reference](#reference)**
+- **[macOS (Apple Silicon)](#macos-apple-silicon)** · **[Updating and removing](#updating-and-removing)** · **[Gotchas](#gotchas)** · **[Reference](#reference)**
 
 ## Install
 
@@ -54,10 +54,13 @@ cbde self-destruct
 ```bash
 git clone <this repo> ~/iog/cbde
 cd ~/iog/cbde
-docker build -t cbde:latest .              # ~15 min, once
 ln -s "$PWD/bin/cbde" ~/.local/bin/cbde    # put the launcher on PATH
+cbde pull                                  # ghcr.io/input-output-hk/cbde:latest -> cbde:latest
 cbde doctor
 ```
+
+The image is multi-arch (amd64 and arm64); `docker pull` picks your host's.
+Building it yourself instead (`cbde build`, ~15–30 min) works on either.
 
 ## How it works
 
@@ -471,7 +474,9 @@ For PBT test discovery, remember the per-project Node dependencies
 > **Caveat, honestly**: dev-container mode uses the documented
 > `remoteUser` + `updateRemoteUserUID` mechanism, but has not yet been verified
 > in a real VS Code session. If the uid mapping misbehaves, please report it —
-> CLI mode is the well-tested path today.
+> CLI mode is the well-tested path today. Known limit: `updateRemoteUserUID`
+> only acts on Linux hosts, so on macOS the dev container always runs as
+> `cbde` (uid 1000). That is fine there — see [macOS](#macos-apple-silicon).
 
 ## Running as your own user
 
@@ -494,10 +499,87 @@ one published image serves everybody.
 - With **no** project mounted, the container stays root.
 - The first run on a volume prints `handing /nix to uid …` and takes a moment
   (it is thousands of files). It is recorded and never repeated.
-- On Docker Desktop (macOS/Windows) ownership is virtualised and the mount looks
-  root-owned, so the container stays root — which is correct there.
+- On Docker Desktop, Colima and OrbStack (macOS/Windows) ownership is
+  _virtualised_: the mount looks root-owned from inside, yet any uid may write
+  to it and files come out as you on the host. There the container adopts the
+  image's `cbde` user (uid 1000) instead — not root — so that CLI runs and the
+  VS Code dev container (which always runs as `cbde` on macOS) share one owner
+  of the volume. `cbde doctor` reports this as "ownership is virtualised".
+- A root-owned mount that uid 1000 _cannot_ write to is a Linux host really
+  running as root (CI, say); the container stays root there.
 
 `cbde doctor` reports which user you are and whether new files will be yours.
+
+## macOS (Apple Silicon)
+
+The image is native arm64 on Apple Silicon (and any aarch64 Linux host): GHC,
+cabal, plustan, aiken, Lean, Z3 and Nix all run at full speed, nothing is
+emulated. Docker picks the right architecture on `pull`; `cbde build` builds
+the native one in ~30 minutes.
+
+**Nix and the IOG caches.** Nix runs natively as `aarch64-linux`, and IOG's
+binary caches (`cache.iog.io`, `sc-testing-tools.cachix.org`) publish
+`x86_64-linux` only. A project that depends on them — `sc-testing-tools` — would
+build its whole GHC closure from source natively. Instead, tell Nix to use the
+x86_64 closure:
+
+```bash
+cbde run nix develop --system x86_64-linux -c cabal build all
+```
+
+The arm64 image's `nix.conf` has `extra-platforms = x86_64-linux aarch64-linux`,
+so Nix accepts that, substitutes everything from the caches, and the x86_64
+binaries run through the Docker VM's Rosetta binfmt — GHC included, at roughly
+half native speed for your own code. That needs **Rosetta enabled in your
+Docker runtime**; it is not always the default:
+
+| Runtime        | Rosetta                                                                             |
+| -------------- | ----------------------------------------------------------------------------------- |
+| Docker Desktop | Settings → General → _Use Rosetta for x86_64/amd64 emulation on Apple Silicon_       |
+| Colima         | `colima stop && colima start --vm-type vz --vz-rosetta` (Colima defaults to `rosetta: false`) |
+| OrbStack       | on by default                                                                       |
+
+`cbde doctor` runs a tiny x86_64 probe and reports under **Platform** whether
+this works. Without it everything native still works; only `--system x86_64-linux`
+is unavailable. (Nix's seccomp filter cannot load under Rosetta, so the image
+sets `filter-syscalls = false`; that only affects setuid bits inside builds.)
+
+**Give the VM enough memory and CPUs.** The container lives in a Linux VM sized
+by the runtime, not by your Mac. Colima's default is **2 CPUs / 2 GB**, Docker
+Desktop's often 4 GB — both too small. Building the plutus dependencies needs
+8 GB; compiling your own `plutus-tx-plugin` modules needs more — a single GHC
+process on a real validator was measured at 10.7 GB and OOM-killed in a 12 GB
+VM. Give it 16 GB or more:
+
+```bash
+colima stop && colima start --cpu 8 --memory 16      # Docker Desktop: Settings → Resources
+```
+
+The virtual disk must hold the image (~2.3 GB) plus the volume (6.5 GB after the
+first run, 25–30 GB after building `sc-testing-tools` a few times). `cbde doctor`
+reports what the container actually sees and fails under 8 GB. If a build dies
+with "The build process was killed (i.e. SIGKILL)", it was the VM's OOM killer:
+more memory, or `cabal build -j1`.
+
+Smaller things:
+
+- **Bind mounts are slow.** Your project is shared into the VM over VirtioFS;
+  `dist-newstyle` and `.hie` there are the slow path. `--builddir=dist-newstyle-docker`
+  helps (you want it anyway if you also build on the host — [gotcha 3](#gotchas)).
+  The `/nix` volume is native to the VM and fast.
+- **Ownership is virtualised** on the mount: the container adopts uid 1000 and
+  files come out as you. See [Running as your own user](#running-as-your-own-user).
+- **`cbde volume info` prints a mountpoint inside the VM.** It does not exist on
+  the Mac; cosmetic.
+- **Docker Desktop shares only some directories** by default (`/Users`, `/Volumes`,
+  `/private`, `/tmp`, `/var/folders`); a project elsewhere fails with "mounts
+  denied" — add its parent under Settings → Resources → File sharing. Colima
+  shares `$HOME` (`mounts:` in its config), and nothing else: `/tmp` is not shared.
+- **Symlinked paths.** macOS's `/tmp` and `/var` are symlinks into `/private`; the
+  launcher resolves them (`pwd -P`) so `cbde info`'s `workdir` is right.
+- **`CBDE_PLATFORM=linux/amd64`** runs the x86_64 image under Rosetta instead.
+  It works (`cbde doctor` says so), it is just 2–3× slower; only useful for
+  reproducing an x86_64-only problem.
 
 ## Updating and removing
 
@@ -522,8 +604,8 @@ Meanwhile, by hand:
 
 ```bash
 # update
-docker pull cbde:latest          # once the image is published
-cd ~/iog/cbde && git pull && docker build -t cbde:latest .
+cbde pull                        # ghcr.io/input-output-hk/cbde:latest -> cbde:latest
+cd ~/iog/cbde && git pull        # for the launcher (and `cbde build` on Linux)
 
 # remove
 docker rmi cbde:latest cbde:base
@@ -581,6 +663,8 @@ Launcher-side (host):
 | ------------------ | ------------- | --------------------------------------------------------------- |
 | `CBDE_IMAGE`       | `cbde:latest` | which image to run                                              |
 | `CBDE_VOLUME`      | `cbde-data`   | which volume to mount at `/nix`                                 |
+| `CBDE_PLATFORM`    | _(native)_    | force a platform on `docker run`/`pull`/`build`, e.g. `linux/amd64` on Apple Silicon (emulated) |
+| `CBDE_REGISTRY`    | `ghcr.io/input-output-hk/cbde` | where `cbde pull` fetches from                 |
 | `CBDE_DOCKER_ARGS` | —             | extra `docker run` flags, e.g. `'-p 8080:8080 -v ~/data:/data'` |
 
 ### Launcher commands
@@ -594,9 +678,10 @@ Launcher-side (host):
 | `cbde list` / `doctor` / `update`             | forwarded to the in-container `cbde`                         |
 | `cbde ghc` / `hls` / `lean` / `cabal-version` | version switching                                            |
 | `cbde devcontainer`                           | write `.devcontainer/devcontainer.json` here                 |
-| `cbde pull` / `build`                         | fetch or build the image                                     |
+| `cbde pull [tag]`                             | pull `$CBDE_REGISTRY:<tag>` and name it `cbde:latest`        |
+| `cbde build [docker args]`                    | build the image from the checkout, for the host's architecture |
 | `cbde volume [info\|rm]`                      | inspect or delete the volume                                 |
-| `cbde info`                                   | show resolved image, volume and paths                        |
+| `cbde info`                                   | show resolved image, registry, volume, platform and paths    |
 | `cbde upgrade` / `self-destruct`              | 🚧 placeholders, see [above](#updating-and-removing)         |
 
 ### Building the image yourself
@@ -606,6 +691,15 @@ docker build --target base -t cbde:base .   # system layer only
 docker build -t cbde:latest .               # everything
 cbde build                                  # same, from anywhere
 ```
+
+The Dockerfile is multi-arch: it builds natively for `amd64` and `arm64`
+(`TARGETARCH` selects the ghcup and aiken downloads; everything else compiles
+from source). Cross-building with `--platform` works but runs the compilers
+under emulation for hours — build native and let CI produce the other half.
+CI (`.github/workflows/docker.yml`) builds both on native runners and pushes a
+multi-arch manifest to `ghcr.io/input-output-hk/cbde:<version>` and `:latest` on
+every push to `main` — the GHCR package has to be public for `cbde pull` to
+work without `docker login ghcr.io`.
 
 | Image         | To pull | Unpacked |
 | ------------- | ------- | -------- |
