@@ -32,8 +32,8 @@ if [ -z "${CBDE_DROPPED:-}" ] && [ "$(id -u)" = 0 ]; then
 
   # Whoever owns the mounted project is who we should be. /workspace is the
   # documented mount point; $PWD covers a project mounted somewhere else with
-  # -w. A root-owned directory means no bind mount (or a platform where
-  # ownership is virtualised, e.g. Docker Desktop) — stay root, nothing to fix.
+  # -w. A root-owned directory means no bind mount — stay root, nothing to fix
+  # — or a runtime that virtualises ownership, handled next.
   if [ -z "$target_uid" ]; then
     for candidate in /workspace "$PWD"; do
       [ -d "$candidate" ] || continue
@@ -41,6 +41,31 @@ if [ -z "${CBDE_DROPPED:-}" ] && [ "$(id -u)" = 0 ]; then
       if [ "$c_uid" != 0 ]; then
         target_uid="$c_uid"
         target_gid="$(stat -c %g "$candidate" 2>/dev/null || echo "$c_uid")"
+        break
+      fi
+    done
+  fi
+
+  # Docker Desktop, Colima and friends (macOS/Windows) virtualise ownership: a
+  # bind-mounted project shows up as root's, yet any uid may write to it and
+  # files come out owned by the host user regardless. Staying root there is
+  # harmless for CLI runs, but it leaves /nix root-owned, and the devcontainer
+  # template runs as `cbde` (uid 1000) — which then cannot provision into the
+  # volume. So on a root-owned *mount* that uid 1000 can nevertheless write
+  # to, adopt the image's cbde user; that keeps CLI and devcontainer mode on
+  # the same uid. A root-owned mount uid 1000 cannot write is a real Linux
+  # host running as root: leave that alone.
+  if [ -z "$target_uid" ]; then
+    image_uid="$(id -u cbde 2>/dev/null || echo 1000)"
+    image_gid="$(id -g cbde 2>/dev/null || echo 1000)"
+    for candidate in /workspace "$PWD"; do
+      [ -d "$candidate" ] || continue
+      awk -v m="$candidate" '$2 == m { f = 1 } END { exit !f }' /proc/self/mounts || continue
+      [ "$(stat -c %u "$candidate" 2>/dev/null)" = 0 ] || continue
+      if setpriv --reuid "$image_uid" --regid "$image_gid" --clear-groups \
+           test -w "$candidate" 2>/dev/null; then
+        target_uid="$image_uid"
+        target_gid="$image_gid"
         break
       fi
     done
