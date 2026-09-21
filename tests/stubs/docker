@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# Fake docker for the launcher tests. Logs every call to $STUB_LOG and answers
+# the few queries the launcher makes:
+#   STUB_IMAGES         space-separated refs that `image inspect` reports present
+#   STUB_IMAGE_VERSION  CBDE_IMAGE_VERSION that `image inspect -f` reports
+#   STUB_PULL_FAIL      set to make `docker pull` fail
+printf 'docker %s\n' "$*" >> "${STUB_LOG:?STUB_LOG is not set}"
+case "${1:-} ${2:-}" in
+  "image inspect")
+    case " $* " in
+      *" -f "*|*" --format "*) printf 'PATH=/usr/bin\nCBDE_IMAGE_VERSION=%s\n' "${STUB_IMAGE_VERSION:-0.2.0}"; exit 0 ;;
+    esac
+    for ref; do :; done
+    case " ${STUB_IMAGES:-} " in *" $ref "*) exit 0 ;; *) exit 1 ;; esac ;;
+  "pull "*) [ -z "${STUB_PULL_FAIL:-}" ] || { echo "stub: pull failed" >&2; exit 1; } ;;
+  "volume inspect") exit 1 ;;
+esac
+exit 0

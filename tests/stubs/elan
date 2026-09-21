@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# Fake elan, shaped like elan 4.2: `toolchain list` prints bare names, `show`
+# prints "<default> (default)" then a Lean version line.
+#   STUB_LEAN        the default toolchain; unset = v4.24.0; empty = none installed
+#   STUB_LEAN_EXTRA  additional installed toolchains, space-separated
+printf 'elan %s\n' "$*" >> "${STUB_LOG:-/dev/null}"
+default="${STUB_LEAN-leanprover/lean4:v4.24.0}"
+case "${1:-} ${2:-}" in
+  "toolchain list")
+    for t in ${STUB_LEAN_EXTRA:-}; do echo "$t"; done
+    [ -n "$default" ] && echo "$default"
+    exit 0 ;;
+  "show "*)
+    if [ -n "$default" ]; then printf '%s (default)\nLean (version stub)\n' "$default"; else echo "no default toolchain configured"; fi
+    exit 0 ;;
+esac
+exit 0

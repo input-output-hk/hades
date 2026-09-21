@@ -5,6 +5,11 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+    inputs:
+      matrix:
+        description: compatibility matrix to build (a name from matrices/; default newest)
+        required: false
+        default: ''
 
 # Multi-arch image, each platform built natively (emulating a GHC toolchain
 # build takes hours). The arm64 job needs an arm64 runner: `ubuntu-24.04-arm`
@@ -14,7 +19,21 @@ env:
   IMAGE: ghcr.io/${{ github.repository_owner }}/cbde
 
 jobs:
+  # The scripts, with docker/ghcup/elan stubbed. macOS is in the matrix because
+  # the launcher must run on its stock bash 3.2, and that is the only place to
+  # prove it. Nothing here pulls or builds an image; it takes seconds.
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: tests/run
+
   build:
+    needs: test
     strategy:
       fail-fast: false
       matrix:
@@ -28,18 +47,26 @@ jobs:
       contents: read
       packages: write
     outputs:
-      version: ${{ steps.version.outputs.version }}
+      version: ${{ steps.matrix.outputs.version }}
+      newest: ${{ steps.matrix.outputs.newest }}
     steps:
       - uses: actions/checkout@v4
 
-      # The version tag comes from the Dockerfile so that the image, the volume
-      # stamp and the devcontainer template all agree on one number.
-      - name: Read image version
-        id: version
+      # The compatibility matrix is the single source of pins: every line of
+      # matrices/<version>.env becomes a --build-arg, and the version is the
+      # image tag. The Dockerfile refuses to build if its defaults disagree.
+      - name: Resolve the compatibility matrix
+        id: matrix
         run: |
-          v="$(sed -n 's/^ARG CBDE_IMAGE_VERSION=//p' Dockerfile | head -1)"
-          [ -n "$v" ] || { echo "CBDE_IMAGE_VERSION not found in Dockerfile" >&2; exit 1; }
-          echo "version=$v" >> "$GITHUB_OUTPUT"
+          name='${{ inputs.matrix }}'
+          newest="$(ls matrices/*.env | sed 's|.*/||; s|\.env$||' | sort -V | tail -n 1)"
+          [ -n "$name" ] || name="$newest"
+          f="matrices/$name.env"
+          [ -f "$f" ] || { echo "no such matrix: $name" >&2; exit 1; }
+          . lib/matrix.sh && matrix_validate "$f"
+          echo "version=$name" >> "$GITHUB_OUTPUT"
+          echo "newest=$([ "$name" = "$newest" ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+          { echo 'build_args<<EOF'; grep -E '^[A-Z_]+=' "$f"; echo EOF; } >> "$GITHUB_OUTPUT"
           echo "arch=${{ matrix.platform }}" | tr / - | sed 's/linux-//' >> "$GITHUB_OUTPUT"
 
       - name: Log in to GHCR
@@ -57,6 +84,7 @@ jobs:
         with:
           context: .
           platforms: ${{ matrix.platform }}
+          build-args: ${{ steps.matrix.outputs.build_args }}
           outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=${{ github.event_name != 'pull_request' }}
           cache-from: type=gha,scope=${{ matrix.platform }}
           cache-to: type=gha,mode=max,scope=${{ matrix.platform }}
@@ -69,7 +97,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: github.event_name != 'pull_request'
         with:
-          name: digest-${{ steps.version.outputs.arch }}
+          name: digest-${{ steps.matrix.outputs.arch }}
           path: /tmp/digests/*
           if-no-files-found: error
           retention-days: 1
@@ -91,11 +119,14 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+      # The immutable tag is the matrix name; `latest` only moves when the
+      # newest matrix was built, so rebuilding an old one never rolls users back.
       - name: Create multi-arch manifest
         working-directory: /tmp/digests
         run: |
+          latest=
+          [ "${{ needs.build.outputs.newest }}" = true ] && latest="-t $IMAGE:latest"
           docker buildx imagetools create \
-            -t "$IMAGE:${{ needs.build.outputs.version }}" \
-            -t "$IMAGE:latest" \
+            -t "$IMAGE:${{ needs.build.outputs.version }}" $latest \
             $(printf "$IMAGE@sha256:%s " *)
-          docker buildx imagetools inspect "$IMAGE:latest"
+          docker buildx imagetools inspect "$IMAGE:${{ needs.build.outputs.version }}"

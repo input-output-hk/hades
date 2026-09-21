@@ -20,7 +20,35 @@
 # as an unbound variable under set -u).
 set -euo pipefail
 
-IMAGE="${CBDE_IMAGE:-cbde:latest}"
+die()  { printf 'cbde: %s\n' "$*" >&2; exit 1; }
+note() { printf '\033[33m%s\033[0m\n' "$*" >&2; }
+
+# Physical paths throughout. git already resolves symlinks in --show-toplevel;
+# $PWD does not, so on macOS (/tmp -> /private/tmp, /var -> /private/var, a
+# home on an external volume) the two disagree and the relative part below
+# comes out wrong.
+physical_pwd() { pwd -P; }
+
+project_root() {
+  git rev-parse --show-toplevel 2>/dev/null || physical_pwd
+}
+
+# A project may pin the compatibility matrix it was written against in a
+# `.cbde` file at its root (`matrix=0.2.0`); the launcher then runs the image
+# of that matrix, cbde:0.2.0, instead of cbde:latest. Written by `cbde matrix`.
+PIN_FILE=.cbde
+matrix_name_ok() { case "$1" in ''|.*|*[!A-Za-z0-9._-]*) return 1 ;; *) return 0 ;; esac; }
+project_matrix() {
+  [ -f "$1/$PIN_FILE" ] || return 0
+  sed -n 's/^[[:space:]]*matrix[[:space:]]*=[[:space:]]*//p' "$1/$PIN_FILE" | head -n 1 | tr -d '[:space:]'
+}
+
+ROOT="$(project_root)"
+PIN="$(project_matrix "$ROOT")"
+[ -z "$PIN" ] || matrix_name_ok "$PIN" || die "invalid matrix name in $ROOT/$PIN_FILE: $PIN"
+
+# Explicit CBDE_IMAGE wins, then the project's pin, then latest.
+IMAGE="${CBDE_IMAGE:-cbde:${PIN:-latest}}"
 VOLUME="${CBDE_VOLUME:-cbde-data}"
 # The image is multi-arch (amd64, arm64) and Docker picks the host's native one.
 # CBDE_PLATFORM forces another, e.g. linux/amd64 on an Apple Silicon Mac to run
@@ -34,9 +62,6 @@ REGISTRY="${CBDE_REGISTRY:-ghcr.io/input-output-hk/cbde}"
 HOST_OS="$(uname -s)"
 HOST_ARCH="$(uname -m)"
 
-die()  { printf 'cbde: %s\n' "$*" >&2; exit 1; }
-note() { printf '\033[33m%s\033[0m\n' "$*" >&2; }
-
 usage() {
   cat <<USAGE
 cbde — run the Cardano toolchain container against the current project.
@@ -49,6 +74,10 @@ cbde — run the Cardano toolchain container against the current project.
 Toolchain (forwarded to cbde inside the container):
   cbde list                   installed and active versions
   cbde doctor                 check this container, volume and platform
+  cbde matrix                 which compatibility matrix this project runs, verified or custom
+  cbde matrix list            every matrix the image knows about
+  cbde matrix <name>          pin this project to matrix <name> (pulls cbde:<name> if needed)
+  cbde matrix unpin           back to cbde:latest
   cbde ghc [version]          show or switch GHC
   cbde cabal-version [v]      show or switch cabal
   cbde hls [version]          install the language server
@@ -57,8 +86,9 @@ Toolchain (forwarded to cbde inside the container):
   cbde update                 refresh ghcup release metadata
 
 Host side:
-  cbde pull [tag]             pull $REGISTRY:<tag> and name it $IMAGE
-  cbde build [docker args]    build the image from this repo (native arch)
+  cbde pull [tag]             pull $REGISTRY:<tag> and name it cbde:<tag> and cbde:<version>
+  cbde build [--matrix <name>] [docker args]
+                              build matrix <name> (default: newest) from this repo, native arch
   cbde volume [info|rm]       inspect or delete the $VOLUME volume
   cbde info                   show what image, volume, platform and paths resolve to
   cbde upgrade                update the launcher and image   (not yet built)
@@ -66,7 +96,7 @@ Host side:
   cbde help
 
 Environment:
-  CBDE_IMAGE=$IMAGE
+  CBDE_IMAGE=$IMAGE${PIN:+   (project pinned to matrix $PIN)}
   CBDE_VOLUME=$VOLUME
   CBDE_PLATFORM=${PLATFORM:-(native)}
   CBDE_REGISTRY=$REGISTRY
@@ -76,16 +106,6 @@ USAGE
 }
 
 have_docker() { command -v docker >/dev/null 2>&1 || die "docker is not installed or not on PATH"; }
-
-# Physical paths throughout. git already resolves symlinks in --show-toplevel;
-# $PWD does not, so on macOS (/tmp -> /private/tmp, /var -> /private/var, a
-# home on an external volume) the two disagree and the relative part below
-# comes out wrong.
-physical_pwd() { pwd -P; }
-
-project_root() {
-  git rev-parse --show-toplevel 2>/dev/null || physical_pwd
-}
 
 # Everything below /workspace mirrors the host layout, so a run started three
 # directories deep lands three directories deep.
@@ -101,9 +121,9 @@ image_present() { docker image inspect "$IMAGE" >/dev/null 2>&1; }
 
 docker_run() {
   have_docker
-  image_present || die "image $IMAGE not found — run 'cbde pull' or 'cbde build'"
+  image_present || die "image $IMAGE not found — run 'cbde pull${PIN:+ $PIN}' or 'cbde build${PIN:+ --matrix $PIN}'"
 
-  local root; root="$(project_root)"
+  local root="$ROOT"
   local wd;   wd="$(workdir_in_container "$root")"
 
   local flags=(--rm)
@@ -161,30 +181,131 @@ cmd_volume() {
   esac
 }
 
-# `cbde pull [tag]` fetches from the registry and gives the result the local
-# name everything else uses. A ref containing a slash is taken verbatim, so
+# The matrix an image was built as, read from its environment.
+image_version() { docker image inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$1" 2>/dev/null | sed -n 's/^CBDE_IMAGE_VERSION=//p' | head -n 1; }
+
+# Give an image ref every local name it deserves: cbde:<tag> as requested,
+# cbde:<version> for what it really is, and $IMAGE if that was set explicitly.
+tag_locally() {
+  local ref="$1" tag="$2" version t done=" $ref "
+  version="$(image_version "$ref")"
+  for t in "cbde:$tag" ${version:+"cbde:$version"} ${CBDE_IMAGE:+"$CBDE_IMAGE"}; do
+    case "$done" in *" $t "*) continue ;; esac
+    docker tag "$ref" "$t"; done="$done$t "
+  done
+  printf 'cbde: %s is now cbde:%s%s\n' "$ref" "$tag" "${version:+ (matrix $version, also cbde:$version)}" >&2
+}
+
+# `cbde pull [tag]` fetches from the registry and gives the result its local
+# names. A ref containing a slash is taken verbatim, so
 # `cbde pull ghcr.io/someone/cbde:dev` works for forks.
 cmd_pull() {
   have_docker
-  local ref="${1:-latest}"
+  local ref="${1:-latest}" tag
   case "$ref" in
-    */*) ;;
-    *)   ref="$REGISTRY:$ref" ;;
+    */*) tag="${ref##*:}"; case "$tag" in */*) tag=latest ;; esac ;;
+    *)   tag="$ref"; ref="$REGISTRY:$ref" ;;
   esac
   docker pull ${PLATFORM:+--platform "$PLATFORM"} "$ref"
-  [ "$ref" = "$IMAGE" ] || docker tag "$ref" "$IMAGE"
-  printf 'cbde: %s is now %s\n' "$ref" "$IMAGE" >&2
+  tag_locally "$ref" "$tag"
 }
 
+# Pin the project to a matrix: make sure its image is here, record the pin,
+# and keep an existing devcontainer.json on the same image.
+write_pin() {
+  local f="$ROOT/$PIN_FILE"
+  if [ -f "$f" ] && grep -q '^[[:space:]]*matrix[[:space:]]*=' "$f"; then
+    sed 's/^[[:space:]]*matrix[[:space:]]*=.*/matrix='"$1"'/' "$f" > "$f.tmp" && mv "$f.tmp" "$f"
+  else
+    { [ -f "$f" ] || printf '# CBDE project settings — see: cbde matrix\n'; printf 'matrix=%s\n' "$1"; } >> "$f"
+  fi
+}
+
+remove_pin() {
+  local f="$ROOT/$PIN_FILE"
+  [ -f "$f" ] || return 0
+  grep -v '^[[:space:]]*matrix[[:space:]]*=' "$f" > "$f.tmp" || true
+  if grep -q '^[[:space:]]*[^#[:space:]]' "$f.tmp"; then mv "$f.tmp" "$f"; else rm -f "$f.tmp" "$f"; fi
+}
+
+devcontainer_follow() { # NAME: point .devcontainer/devcontainer.json's image at cbde:NAME
+  local dc="$ROOT/.devcontainer/devcontainer.json"
+  [ -f "$dc" ] || return 0
+  grep -q '"image"[[:space:]]*:[[:space:]]*"cbde:' "$dc" || return 0
+  sed 's/\("image"[[:space:]]*:[[:space:]]*"cbde:\)[^"]*"/\1'"$1"'"/' "$dc" > "$dc.tmp" && mv "$dc.tmp" "$dc"
+  printf 'cbde: .devcontainer/devcontainer.json now uses cbde:%s\n' "$1" >&2
+}
+
+pin_matrix() {
+  local name="$1" ref
+  matrix_name_ok "$name" || die "invalid matrix name: $name"
+  have_docker
+  if ! docker image inspect "cbde:$name" >/dev/null 2>&1; then
+    ref="$REGISTRY:$name"
+    note "cbde: cbde:$name is not here yet — pulling $ref"
+    docker pull ${PLATFORM:+--platform "$PLATFORM"} "$ref" \
+      || die "could not pull $ref. From a checkout you can build it: cbde build --matrix $name"
+    tag_locally "$ref" "$name"
+  fi
+  write_pin "$name"
+  devcontainer_follow "$name"
+  printf 'cbde: project %s pinned to matrix %s (image cbde:%s) in %s\n' "$ROOT" "$name" "$name" "$PIN_FILE" >&2
+  [ -z "${CBDE_IMAGE:-}" ] || note "cbde: note that CBDE_IMAGE=$CBDE_IMAGE overrides the pin while it is set"
+}
+
+cmd_matrix() {
+  local sub="${1:-show}"
+  case "$sub" in
+    show|status)
+      printf 'project    %s\n' "$ROOT"
+      if [ -n "$PIN" ]; then printf 'pinned     matrix %s   (%s)\n' "$PIN" "$PIN_FILE"
+      else printf 'pinned     none — running cbde:latest (pin with: cbde matrix <name>)\n'; fi
+      [ -z "${CBDE_IMAGE:-}" ] || printf 'override   CBDE_IMAGE=%s\n' "$CBDE_IMAGE"
+      printf 'image      %s%s\n' "$IMAGE" "$(image_present || printf '  (not pulled)')"
+      image_present || exit 0
+      docker_run cbde matrix show ;;
+    list|ls)  docker_run cbde matrix list ;;
+    reset)    docker_run cbde matrix reset ;;
+    unpin)    remove_pin; printf 'cbde: pin removed, %s runs cbde:latest again\n' "$ROOT" >&2 ;;
+    *)        pin_matrix "$sub" ;;
+  esac
+}
+
+# `cbde build [--matrix NAME] [docker args]`: builds one compatibility matrix
+# from the checkout. The matrix file supplies every pin as a --build-arg, so
+# the Dockerfile's defaults never decide what gets built. The result is tagged
+# cbde:NAME, plus cbde:latest when NAME is the newest matrix (or the project's
+# pin, so `cbde build` in a pinned project builds what it runs).
 cmd_build() {
   have_docker
-  local here; here="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
+  local here name f tags
+  here="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
   [ -f "$here/Dockerfile" ] || die "no Dockerfile at $here — run this from a CBDE checkout"
+  [ -f "$here/lib/matrix.sh" ] || die "no lib/matrix.sh at $here — checkout is incomplete"
+  CBDE_MATRIX_DIR="$here/matrices"
+  # shellcheck source=lib/matrix.sh
+  . "$here/lib/matrix.sh"
+
+  name=
+  if [ "${1:-}" = --matrix ]; then name="${2:-}"; shift 2 || die "build: --matrix needs a name"; fi
+  [ -n "$name" ] || name="${PIN:-$(matrix_newest)}"
+  [ -n "$name" ] || die "no matrices in $here/matrices"
+  f="$(matrix_file "$name")" || exit $?
+  matrix_validate "$f" >&2 || die "matrix $name is malformed (see above)"
+
+  tags=(-t "cbde:$name")
+  [ "$name" = "$(matrix_newest)" ] && tags+=(-t cbde:latest)
+  [ -n "${CBDE_IMAGE:-}" ] && tags+=(-t "$CBDE_IMAGE")
+
   # Native by default. Cross-building (CBDE_PLATFORM set) goes through the
   # runtime's emulator and takes hours; the published multi-arch image is the
   # way to get the other architecture.
   [ -n "$PLATFORM" ] && note "cbde build: building $PLATFORM on $HOST_ARCH — emulated, expect hours"
-  exec docker build ${PLATFORM:+--platform "$PLATFORM"} -t "$IMAGE" "$@" "$here"
+  note "cbde build: matrix $name from $f"
+  # shellcheck disable=SC2046
+  exec docker build ${PLATFORM:+--platform "$PLATFORM"} \
+    $(matrix_build_args "$f") \
+    "${tags[@]}" "$@" "$here"
 }
 
 # Placeholders. Both are documented in the README as coming, so they explain
@@ -226,13 +347,13 @@ EOS
 }
 
 cmd_info() {
-  local root; root="$(project_root)"
   printf 'image      %s%s\n' "$IMAGE" "$(image_present && printf '' || printf '  (not pulled)')"
+  printf 'matrix     %s\n' "${PIN:-(not pinned — latest)}"
   printf 'registry   %s\n' "$REGISTRY"
   printf 'volume     %s\n' "$VOLUME"
   printf 'platform   %s  (host: %s %s)\n' "${PLATFORM:-native}" "$HOST_OS" "$HOST_ARCH"
-  printf 'project    %s  ->  /workspace\n' "$root"
-  printf 'workdir    %s\n' "$(workdir_in_container "$root")"
+  printf 'project    %s  ->  /workspace\n' "$ROOT"
+  printf 'workdir    %s\n' "$(workdir_in_container "$ROOT")"
 }
 
 case "${1:-shell}" in
@@ -246,6 +367,7 @@ case "${1:-shell}" in
                        docker_run cbde "$@" ;;
   cabal-version)       shift; docker_run cbde cabal "$@" ;;
 
+  matrix)              shift; cmd_matrix "$@" ;;
   pull)                shift; cmd_pull "${1:-}" ;;
   build)               shift; cmd_build "$@" ;;
   volume)              shift; cmd_volume "${1:-info}" ;;
