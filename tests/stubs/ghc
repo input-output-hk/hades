@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# STUB_GHC: version to report; unset = 9.6.7; empty = no GHC installed.
+v="${STUB_GHC-9.6.7}"; [ -n "$v" ] || exit 1; echo "$v"

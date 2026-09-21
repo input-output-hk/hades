@@ -2,3 +2,5 @@
 prompt.md
 *.md
 !README.md
+tests
+.plans
