@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# Logs every call. STUB_GHCUP_FAIL: a substring of the arguments that makes the
+# call fail (e.g. "--offline"). Also logs what ghcup's cache dir contains at
+# call time, so tests can check the seed was staged.
+printf 'ghcup %s\n' "$*" >> "${STUB_LOG:-/dev/null}"
+cache="${GHCUP_INSTALL_BASE_PREFIX:-/nix/cbde}/.ghcup/cache"
+[ -d "$cache" ] && printf 'cache: %s\n' "$(ls "$cache" | tr '\n' ' ')" >> "${STUB_LOG:-/dev/null}"
+[ -n "${STUB_GHCUP_FAIL:-}" ] && case " $* " in *"$STUB_GHCUP_FAIL"*) exit 1 ;; esac
+exit 0

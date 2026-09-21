@@ -18,7 +18,7 @@ Those run in the container against the project in your current directory. No
 - **[Install](#install)** · **[How it works](#how-it-works)** · **[Quick start](#quick-start)**
 - **[What's in the box](#whats-in-the-box)** — every pinned version
 - **[The tools, one by one](#the-tools-one-by-one)** — Haskell/Plinth · plustan · Aiken · Blaster · Nix · PBT
-- **[Switching versions](#switching-toolchain-versions)** · **[VS Code](#vs-code-dev-containers)** · **[Your own user](#running-as-your-own-user)**
+- **[Switching versions](#switching-toolchain-versions)** · **[Compatibility matrices](#compatibility-matrices)** · **[VS Code](#vs-code-dev-containers)** · **[Your own user](#running-as-your-own-user)**
 - **[macOS (Apple Silicon)](#macos-apple-silicon)** · **[Updating and removing](#updating-and-removing)** · **[Gotchas](#gotchas)** · **[Reference](#reference)**
 
 ## Install
@@ -155,32 +155,39 @@ a cache, so deleting it costs time, never data.
 Skipping the volume is fine only for the tools that need no toolchain: `aiken`,
 `z3` and `nix` run happily without it.
 
-### 3. The first run downloads the pinned toolchains
+### 3. The first run unpacks the pinned toolchains into the volume
 
-The image ships version _pins_, not the toolchains themselves. The first
-container start against an empty volume installs exactly what those pins ask
-for, then never does it again. It is idempotent, holds a lock so two containers
-can share one volume, and is silent when there is nothing to do.
+The image ships version _pins_ and, for GHC, cabal, the Lean toolchain and
+the package indices, the compressed installers themselves — about 680 MB, not
+the 6 GB they unpack to. The first container start against an empty volume installs exactly what
+the pins ask for, then never does it again. It is idempotent, holds a lock so two containers can
+share one volume, and is silent when there is nothing to do.
 
-| Installed on first run                    | Pinned version             | Why it is not in the image                                   |
-| ----------------------------------------- | -------------------------- | ------------------------------------------------------------ |
-| **GHC**                                   | 9.6.7                      | 2.6 GB installed; also the version users most want to change |
-| **cabal**                                 | 3.10.3.0                   | pairs with the GHC pin                                       |
-| **Lean toolchain** (`lean`, `lake`)       | `leanprover/lean4:v4.24.0` | 2.3 GB installed                                             |
-| **Hackage index**                         | latest                     | ~1 GB, and rewriting it copies the whole layer               |
-| **CHaP index** (Cardano Haskell Packages) | latest                     | same                                                         |
-| **HLS** (language server)                 | _on request only_          | 2.5 GB; run `cbde hls` when you want IDE support             |
+| Installed on first run                    | Pinned version             | Where it comes from                                                        |
+| ----------------------------------------- | -------------------------- | -------------------------------------------------------------------------- |
+| **GHC**                                   | 9.6.7                      | **the image** (203 MB bindist, unpacks to 2.6 GB in ~45 s, no network)     |
+| **cabal**                                 | 3.10.3.0                   | **the image** (5 MB bindist)                                               |
+| **Lean toolchain** (`lean`, `lake`)       | `leanprover/lean4:v4.24.0` | **the image** (390 MB packed, unpacks to 2.3 GB in a few seconds, no network) |
+| **Hackage index**                         | state `2026-09-21T04:01:53Z` | **the image** (61 MB packed with CHaP, unpacks to 1.2 GB in seconds)     |
+| **CHaP index** (Cardano Haskell Packages) | state `2026-09-16T23:53:07Z` | **the image**, same archive                                              |
+| **HLS** (language server)                 | _on request only_          | download, 2.5 GB; run `cbde hls` when you want IDE support                 |
 
-Measured on a fresh volume: **136 seconds**, after which the volume holds
-**6.5 GB** — GHC and cabal 2.6 GB, the Lean toolchain 2.3 GB, the two package
-indices 1.2 GB, the image's Nix store the rest. Once, ever. Every later start
-costs about half a second.
+So with the network cut, a fresh volume gets a working `ghc`, `cabal`, `lean`
+and `lake` and a solver-ready package index from the image; nothing in the
+first start touches the network. Your project's own dependencies still
+download on the first `cabal build`, as anywhere. After the first run the
+volume holds about **6.5 GB** — GHC and cabal 2.6 GB, the Lean
+toolchain 2.3 GB, the two package indices 1.2 GB, the image's Nix store the
+rest. Once, ever. Every later start costs about half a second.
 
 If you never touch Blaster, skip the Lean install entirely with `-e CBDE_LEAN=`
 and save 2.3 GB and about a minute.
 
-Because the pins live in the _image_, pulling a newer CBDE against an existing
-volume installs whatever it newly needs — you do not have to recreate anything.
+The image carries only _its own_ matrix's installers. Anything else you ask
+for — `cbde ghc 9.6.6`, say, or a project whose `index-state` is newer than
+the matrix's — is downloaded as before. Because the pins live
+in the _image_, pulling a newer CBDE against an existing volume installs
+whatever it newly needs — you do not have to recreate anything.
 
 ## Quick start
 
@@ -442,6 +449,74 @@ Two version constraints fail confusingly, so both are worth knowing:
 Prefer a TUI? `ghcup tui` is in there too — `cbde` is a convenience layer over
 ghcup, not a replacement for it.
 
+Every switch takes you off the image's verified set and onto a _custom_ one.
+That is allowed; `cbde matrix` and `cbde doctor` just say so. Read on.
+
+## Compatibility matrices
+
+The thing CBDE actually guarantees is not "GHC is installed" but "these exact
+versions of GHC, cabal, Lean, plustan, Blaster, Z3 and aiken work together". One
+such set is a **compatibility matrix**, and each one ships as its own image:
+matrix `0.2.0` is `cbde:0.2.0`. `cbde:latest` is simply the newest one.
+
+The matrix is a file, [`matrices/0.2.0.env`](matrices/0.2.0.env): fifteen
+`KEY=VALUE` pins, including the Hackage and CHaP index-states the set was
+verified against. It is the single source of truth for the build (every line
+becomes a `--build-arg`, and the image refuses to build if the Dockerfile's
+defaults disagree with it), it is copied into the image, and a running
+container compares itself against it.
+
+```console
+$ cbde matrix
+project    /home/you/work/my-contract
+pinned     none — running cbde:latest (pin with: cbde matrix <name>)
+image      cbde:latest
+
+Compatibility matrix 0.2.0 (this image)
+  baked into the image:
+    plustan main   blaster main   aiken v1.1.23   z3 z3-4.15.2   ghcup 0.2.6.2
+  in the volume, switchable:
+  ✓ GHC    9.6.7
+  ✓ cabal  3.10.3.0
+    HLS    not pinned
+  ✓ Lean   leanprover/lean4:v4.24.0
+
+  ✓ verified: the active toolchain is exactly matrix 0.2.0
+```
+
+After `cbde ghc 9.6.6` the same command reports **custom**, names the
+component that differs, and offers `cbde matrix reset`, which reinstalls or
+reselects whatever the matrix pins. GHC, cabal and Lean come back from the
+image's own installers, so a reset — or a wiped volume — needs no network for
+them.
+Nothing is removed from the volume, so switching back and forth costs nothing
+after the first install.
+
+**Pinning a project.** A project written against a particular matrix records
+it, so everyone who checks it out runs the same image. That image carries its
+own GHC, cabal and Lean installers, so when a pinned matrix's toolchain is not
+in your volume yet, it is unpacked from the image rather than downloaded:
+
+```bash
+cbde matrix 0.1.0        # pulls cbde:0.1.0 if needed, writes .cbde, updates devcontainer.json
+cbde matrix list         # every matrix this image knows about
+cbde matrix unpin        # back to cbde:latest
+```
+
+The pin is one line, `matrix=0.1.0`, in a `.cbde` file at the project root.
+Commit it. From then on every `cbde …` command in that project runs
+`cbde:0.1.0`, `cbde build` builds that matrix, and `.devcontainer/devcontainer.json`
+points VS Code at the same image. `CBDE_IMAGE` still overrides everything when
+set, which `cbde info` will tell you.
+
+Why is a matrix an image rather than a `ghcup set`? Half of the matrix is baked
+in. plustan in particular is compiled against one exact GHC and reads `.hie`
+files from no other, so "matrix 0.1.0 with GHC 9.6.6" also means "the plustan
+built for 9.6.6", and that binary only exists in `cbde:0.1.0`. Running
+`cbde matrix 0.1.0` _inside_ a `0.2.0` container therefore refuses and points
+you at the host-side command. The volume is shared by every image, so an older
+matrix's GHC lands next to the newer one and both stay warm.
+
 ## VS Code Dev Containers
 
 VS Code can attach directly into the container, with the extensions installed
@@ -645,6 +720,22 @@ the new image's pins are provisioned on the next start.
 
 ## Reference
 
+### Tests
+
+```bash
+tests/run              # everything, in seconds
+tests/run launcher     # one file: tests/launcher.test.sh
+```
+
+Plain bash, no framework, nothing to install. `docker`, `ghcup`, `elan` and the
+toolchain binaries are stubs on `PATH` (`tests/stubs`), so the suite asserts on
+the exact `docker run` line the launcher would execute, on what `cbde matrix`
+prints for a given fake volume, and on the repository's own consistency: every
+matrix validates, the Dockerfile defaults equal the newest matrix, every matrix
+key is a Dockerfile `ARG`. CI runs it on Linux and on macOS (stock bash 3.2)
+before any image is built. Real builds and real provisioning are the slow tier
+and stay in CI.
+
 ### Environment variables
 
 | Variable                | Default                    | Effect                                                                |
@@ -661,7 +752,7 @@ Launcher-side (host):
 
 | Variable           | Default       | Effect                                                          |
 | ------------------ | ------------- | --------------------------------------------------------------- |
-| `CBDE_IMAGE`       | `cbde:latest` | which image to run                                              |
+| `CBDE_IMAGE`       | `cbde:latest`, or `cbde:<pin>` | which image to run; overrides a project's `.cbde` pin |
 | `CBDE_VOLUME`      | `cbde-data`   | which volume to mount at `/nix`                                 |
 | `CBDE_PLATFORM`    | _(native)_    | force a platform on `docker run`/`pull`/`build`, e.g. `linux/amd64` on Apple Silicon (emulated) |
 | `CBDE_REGISTRY`    | `ghcr.io/input-output-hk/cbde` | where `cbde pull` fetches from                 |
@@ -677,9 +768,11 @@ Launcher-side (host):
 | `cbde nix <cmd> …`                            | run inside `nix develop`                                     |
 | `cbde list` / `doctor` / `update`             | forwarded to the in-container `cbde`                         |
 | `cbde ghc` / `hls` / `lean` / `cabal-version` | version switching                                            |
+| `cbde matrix [list\|reset]`                   | which compatibility matrix runs here, verified or custom     |
+| `cbde matrix <name>` / `unpin`                | pin this project to matrix `<name>` (pulls `cbde:<name>`), or stop |
 | `cbde devcontainer`                           | write `.devcontainer/devcontainer.json` here                 |
-| `cbde pull [tag]`                             | pull `$CBDE_REGISTRY:<tag>` and name it `cbde:latest`        |
-| `cbde build [docker args]`                    | build the image from the checkout, for the host's architecture |
+| `cbde pull [tag]`                             | pull `$CBDE_REGISTRY:<tag>`; tagged `cbde:<tag>` and `cbde:<version>` |
+| `cbde build [--matrix <name>] [docker args]`  | build a matrix (default: newest, or the project's pin) for the host's architecture |
 | `cbde volume [info\|rm]`                      | inspect or delete the volume                                 |
 | `cbde info`                                   | show resolved image, registry, volume, platform and paths    |
 | `cbde upgrade` / `self-destruct`              | 🚧 placeholders, see [above](#updating-and-removing)         |
@@ -687,10 +780,14 @@ Launcher-side (host):
 ### Building the image yourself
 
 ```bash
-docker build --target base -t cbde:base .   # system layer only
-docker build -t cbde:latest .               # everything
-cbde build                                  # same, from anywhere
+cbde build                                  # newest matrix -> cbde:<version> and cbde:latest
+cbde build --matrix 0.2.0                   # a specific one
+docker build --target base -t cbde:base .   # system layer only, Dockerfile defaults
 ```
+
+`cbde build` reads `matrices/<name>.env` and passes every pin as a
+`--build-arg`. A plain `docker build .` uses the Dockerfile's defaults, which
+mirror the newest matrix; the build fails if they have drifted apart.
 
 The Dockerfile is multi-arch: it builds natively for `amd64` and `arm64`
 (`TARGETARCH` selects the ghcup and aiken downloads; everything else compiles

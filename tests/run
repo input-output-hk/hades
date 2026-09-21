@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# Runs the unit tests: every tests/*.test.sh, each in its own process.
+#
+#   tests/run                # everything
+#   tests/run launcher       # just tests/launcher.test.sh
+#
+# No dependencies beyond bash (3.2 or newer), git, sed and awk. docker, ghcup
+# and elan are stubbed (tests/stubs), so nothing here touches Docker or the
+# network and the whole suite runs in seconds. Image-level checks (a real
+# build, a real provision) are a separate, slower tier and live in CI.
+set -u
+here="$(cd "$(dirname "$0")" && pwd -P)"
+status=0
+for f in "$here"/*.test.sh; do
+  name="$(basename "$f" .test.sh)"
+  if [ $# -gt 0 ]; then case " $* " in *" $name "*) ;; *) continue ;; esac; fi
+  printf '\n\033[1m%s\033[0m\n' "$name"
+  bash "$f" || status=1
+done
+if command -v shellcheck >/dev/null 2>&1; then
+  printf '\n\033[1mshellcheck\033[0m\n'
+  (cd "$here/.." && shellcheck -x -s bash bin/cbde cbde cbde-entrypoint cbde-provision lib/matrix.sh) \
+    && printf '  ok\n' || status=1
+fi
+printf '\n'
+[ "$status" = 0 ] && printf '\033[32mall tests passed\033[0m\n' || printf '\033[31msome tests FAILED\033[0m\n'
+exit "$status"
