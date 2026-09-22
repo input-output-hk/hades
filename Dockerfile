@@ -400,8 +400,10 @@ RUN [ "$CBDE_MATRIX_CHECK" = 0 ] || bash -e -c '\
 
 # The devcontainer template, so `cbde devcontainer` can drop it into a project
 # from inside the container and `cbde doctor` can tell whether a project's copy
-# is current. Stamped with the image version at build time.
-COPY .devcontainer/devcontainer.json /opt/cbde/devcontainer.json
+# is current. Stamped with the image version at build time. It lives under
+# templates/ in the repo: this checkout is the tool, not a Cardano project,
+# and has no .devcontainer of its own.
+COPY templates/devcontainer.json /opt/cbde/devcontainer.json
 ARG CBDE_IMAGE_VERSION
 RUN sed -i "s/\"\/\/cbde-template\": \"dev\"/\"\/\/cbde-template\": \"${CBDE_IMAGE_VERSION}\"/" \
       /opt/cbde/devcontainer.json \

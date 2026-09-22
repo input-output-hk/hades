@@ -5,7 +5,9 @@
 export PATH="$STUBS:$PATH"
 CBDE="$REPO/bin/cbde"
 export STUB_IMAGES="cbde:latest"
-unset CBDE_IMAGE CBDE_PLATFORM CBDE_DOCKER_ARGS CBDE_GHC CBDE_CABAL CBDE_HLS CBDE_LEAN 2>/dev/null || true
+unset CBDE_IMAGE CBDE_PLATFORM CBDE_DOCKER_ARGS CBDE_GHC CBDE_CABAL CBDE_HLS CBDE_LEAN CBDE_REGISTRY CBDE_VOLUME 2>/dev/null || true
+# Never read the developer's real ~/.config/cbde/config; registry tests set their own.
+export XDG_CONFIG_HOME=/nonexistent/cbde-tests
 
 last_docker() { tail -n 1 "$STUB_LOG"; }
 
@@ -74,7 +76,6 @@ test_toolchain_verbs_are_forwarded_to_the_inner_cbde() {
   run "$CBDE" ghc 9.6.6;                assert_match "$(last_docker)" ' cbde:latest cbde ghc 9.6.6$'
   run "$CBDE" cabal-version 3.12.1.0;   assert_match "$(last_docker)" ' cbde:latest cbde cabal 3.12.1.0$'
   run "$CBDE" doctor;                   assert_match "$(last_docker)" ' cbde:latest cbde doctor$'
-  run "$CBDE" matrix list;              assert_match "$(last_docker)" ' cbde:latest cbde matrix list$'
   run "$CBDE" matrix reset;             assert_match "$(last_docker)" ' cbde:latest cbde matrix reset$'
 }
 
@@ -241,8 +242,13 @@ test_build_in_a_pinned_project_builds_the_pin() {
   mkrepo p && cd p
   printf 'matrix=0.1.0\n' > .cbde
   run "$CBDE" build
-  assert_rc "$rc" 1 "the checkout has no 0.1.0 matrix, so this must fail loudly: $out"
-  assert_contains "$out" "no such matrix: 0.1.0"
+  assert_rc "$rc" 0 "$out"
+  assert_contains "$(last_docker)" " --build-arg CBDE_GHC=9.6.6 "
+  assert_contains "$(last_docker)" " -t cbde:0.1.0 "
+  assert_not_contains "$(last_docker)" " -t cbde:latest " "an older matrix never moves latest"
+  printf 'matrix=9.9.9\n' > .cbde
+  run "$CBDE" build
+  assert_rc "$rc" 1; assert_contains "$out" "no such matrix: 9.9.9"
 }
 
 test_help_and_unknown_flags() {
@@ -250,6 +256,200 @@ test_help_and_unknown_flags() {
   assert_rc "$rc" 0; assert_contains "$out" "cbde matrix <name>"
   run "$CBDE" --help
   assert_rc "$rc" 0
+}
+
+# ---- local registry and the config file ------------------------------------
+with_cfg() { export XDG_CONFIG_HOME="$T/xdg"; CFG="$T/xdg/cbde/config"; }
+
+test_registry_up_starts_registry_and_writes_config() {
+  with_cfg; mkrepo p && cd p
+  run "$CBDE" registry up
+  assert_rc "$rc" 0 "$out"
+  assert_contains "$(cat "$STUB_LOG")" "docker run -d --name cbde-registry --restart unless-stopped -p 5000:5000 -v cbde-registry-data:/var/lib/registry -e REGISTRY_STORAGE_DELETE_ENABLED=true registry:2"
+  assert_eq "$(sed -n 's/^registry=//p' "$CFG")" "localhost:5000/cbde"
+  assert_contains "$out" "registry is now localhost:5000/cbde"
+  run "$CBDE" info
+  assert_contains "$out" "registry   localhost:5000/cbde  (from: $CFG)"
+}
+
+test_registry_up_restarts_a_stopped_one_and_is_idempotent() {
+  with_cfg; mkrepo p && cd p
+  STUB_CONTAINERS="cbde-registry:stopped" run "$CBDE" registry up
+  assert_rc "$rc" 0 "$out"
+  assert_contains "$(cat "$STUB_LOG")" "docker start cbde-registry"
+  assert_not_contains "$(cat "$STUB_LOG")" "docker run -d"
+  : > "$STUB_LOG"
+  STUB_CONTAINERS="cbde-registry" run "$CBDE" registry up
+  assert_rc "$rc" 0 "$out"
+  assert_contains "$out" "already running"
+  assert_not_contains "$(cat "$STUB_LOG")" "docker run -d"
+}
+
+test_config_registry_is_used_by_pull_and_pin_and_env_wins() {
+  with_cfg; mkrepo p && cd p
+  mkdir -p "$T/xdg/cbde"; printf 'registry=localhost:5000/cbde\n' > "$CFG"
+  STUB_IMAGE_VERSION=0.2.0 run "$CBDE" pull
+  assert_contains "$(cat "$STUB_LOG")" "docker pull localhost:5000/cbde:latest"
+  : > "$STUB_LOG"
+  STUB_IMAGES= STUB_IMAGE_VERSION=0.1.0 run "$CBDE" matrix 0.1.0
+  assert_contains "$(cat "$STUB_LOG")" "docker pull localhost:5000/cbde:0.1.0"
+  : > "$STUB_LOG"
+  CBDE_REGISTRY=ghcr.io/other/cbde STUB_IMAGE_VERSION=0.2.0 run "$CBDE" pull
+  assert_contains "$(cat "$STUB_LOG")" "docker pull ghcr.io/other/cbde:latest"
+  CBDE_REGISTRY=ghcr.io/other/cbde run "$CBDE" info
+  assert_contains "$out" "registry   ghcr.io/other/cbde  (from: CBDE_REGISTRY)"
+}
+
+test_config_volume_and_platform_are_honoured() {
+  with_cfg; mkrepo p && cd p
+  mkdir -p "$T/xdg/cbde"; printf 'volume=my-vol\nplatform=linux/amd64\n' > "$CFG"
+  run "$CBDE" true
+  assert_rc "$rc" 0 "$out"
+  assert_contains "$(last_docker)" " --platform linux/amd64 "
+  assert_contains "$(last_docker)" " -v my-vol:/nix "
+}
+
+test_registry_down_removes_container_and_restores_default() {
+  with_cfg; mkrepo p && cd p
+  mkdir -p "$T/xdg/cbde"; printf 'registry=localhost:5000/cbde\nvolume=keep-me\n' > "$CFG"
+  run "$CBDE" registry down
+  assert_rc "$rc" 0 "$out"
+  assert_contains "$(cat "$STUB_LOG")" "docker rm -f cbde-registry"
+  assert_not_contains "$(cat "$STUB_LOG")" "docker volume rm"
+  assert_eq "$(cat "$CFG")" "volume=keep-me" "only the registry line goes; other settings stay"
+  run "$CBDE" info
+  assert_contains "$out" "registry   ghcr.io/input-output-hk/cbde  (from: default)"
+  run "$CBDE" registry down --purge
+  assert_contains "$(cat "$STUB_LOG")" "docker volume rm cbde-registry-data"
+}
+
+test_registry_down_leaves_a_foreign_registry_setting_alone() {
+  with_cfg; mkrepo p && cd p
+  mkdir -p "$T/xdg/cbde"; printf 'registry=ghcr.io/myfork/cbde\n' > "$CFG"
+  run "$CBDE" registry down
+  assert_eq "$(sed -n 's/^registry=//p' "$CFG")" "ghcr.io/myfork/cbde"
+}
+
+test_registry_push_tags_and_pushes_local_images() {
+  with_cfg; mkrepo p && cd p
+  mkdir -p "$T/xdg/cbde"; printf 'registry=localhost:5000/cbde\n' > "$CFG"
+  STUB_IMAGES="cbde:0.2.0 cbde:0.1.0 cbde:latest" STUB_TAGS="0.1.0 0.2.0 latest base" run "$CBDE" registry push
+  assert_rc "$rc" 0 "$out"
+  local log; log="$(cat "$STUB_LOG")"
+  assert_contains "$log" "docker tag cbde:0.1.0 localhost:5000/cbde:0.1.0"
+  assert_contains "$log" "docker push localhost:5000/cbde:0.2.0"
+  assert_contains "$log" "docker push localhost:5000/cbde:latest"
+  assert_not_contains "$log" "cbde:base" "only version tags and latest"
+  : > "$STUB_LOG"
+  STUB_IMAGES="cbde:0.2.0" run "$CBDE" registry push 0.2.0
+  assert_eq "$(grep -c 'docker push' "$STUB_LOG")" 1
+  STUB_IMAGES= run "$CBDE" registry push 9.9.9
+  assert_rc "$rc" 1; assert_contains "$out" "no local image cbde:9.9.9"
+}
+
+test_registry_status_and_unknown_subcommand() {
+  with_cfg; mkrepo p && cd p
+  run "$CBDE" registry
+  assert_rc "$rc" 0 "$out"
+  assert_contains "$out" "registry   ghcr.io/input-output-hk/cbde  (from: default)"
+  assert_contains "$out" "local      not running"
+  run "$CBDE" registry bogus
+  assert_rc "$rc" 1; assert_contains "$out" "unknown registry subcommand"
+}
+
+test_registry_list_prints_tags_version_sorted() {
+  with_cfg; mkrepo p && cd p
+  mkdir -p "$T/xdg/cbde"; printf 'registry=localhost:5000/cbde\n' > "$CFG"
+  STUB_TAGS_JSON='{"name":"cbde","tags":["latest","0.10.0","0.2.0"]}' run "$CBDE" registry list
+  assert_rc "$rc" 0 "$out"
+  assert_eq "$out" $'localhost:5000/cbde:0.2.0\nlocalhost:5000/cbde:0.10.0\nlocalhost:5000/cbde:latest'
+  assert_contains "$(cat "$STUB_LOG")" "http://localhost:5000/v2/cbde/tags/list"
+  STUB_TAGS_JSON='{"tags":[]}' run "$CBDE" registry list
+  assert_contains "$out" "no tags in localhost:5000/cbde"
+}
+
+test_registry_rm_deletes_by_digest_and_garbage_collects() {
+  with_cfg; mkrepo p && cd p
+  mkdir -p "$T/xdg/cbde"; printf 'registry=localhost:5000/cbde\n' > "$CFG"
+  STUB_TAGS_JSON='{"tags":["0.1.0","0.2.0","latest"]}' STUB_DIGESTS="0.1.0=sha256:111 0.2.0=sha256:222 latest=sha256:222" \
+    run "$CBDE" registry rm 0.1.0
+  assert_rc "$rc" 0 "$out"
+  assert_contains "$(cat "$STUB_LOG")" "curl -sS --max-time 10 -o /dev/null -w %{http_code} -X DELETE http://localhost:5000/v2/cbde/manifests/sha256:111"
+  assert_contains "$(cat "$STUB_LOG")" "docker exec cbde-registry registry garbage-collect --delete-untagged"
+  assert_contains "$out" "removed localhost:5000/cbde:0.1.0"
+  assert_not_contains "$out" "shares its image"
+}
+
+test_registry_rm_refuses_shared_manifest_without_yes() {
+  with_cfg; mkrepo p && cd p
+  mkdir -p "$T/xdg/cbde"; printf 'registry=localhost:5000/cbde\n' > "$CFG"
+  STUB_TAGS_JSON='{"tags":["0.2.0","latest"]}' run "$CBDE" registry rm 0.2.0
+  assert_rc "$rc" 1
+  assert_contains "$out" "0.2.0 shares its image with: latest"
+  assert_contains "$out" "cbde registry rm 0.2.0 --yes"
+  assert_not_contains "$(cat "$STUB_LOG")" "DELETE"
+  STUB_TAGS_JSON='{"tags":["0.2.0","latest"]}' run "$CBDE" registry rm 0.2.0 --yes
+  assert_rc "$rc" 0 "$out"
+  assert_contains "$out" "removed localhost:5000/cbde:0.2.0 (and latest )"
+}
+
+test_registry_rm_errors_are_explained() {
+  with_cfg; mkrepo p && cd p
+  mkdir -p "$T/xdg/cbde"; printf 'registry=localhost:5000/cbde\n' > "$CFG"
+  STUB_DIGESTS="9.9.9=none" run "$CBDE" registry rm 9.9.9
+  assert_rc "$rc" 1; assert_contains "$out" "no tag 9.9.9"
+  STUB_TAGS_JSON='{"tags":["0.1.0"]}' STUB_DELETE_CODE=405 run "$CBDE" registry rm 0.1.0
+  assert_rc "$rc" 1; assert_contains "$out" "deletes disabled"; assert_contains "$out" "cbde registry down && cbde registry up"
+  run "$CBDE" registry rm
+  assert_rc "$rc" 1; assert_contains "$out" "which tag"
+  rm "$CFG"; : > "$STUB_LOG"
+  run "$CBDE" registry rm 0.1.0
+  assert_rc "$rc" 1; assert_contains "$out" "local registry only"
+  assert_not_contains "$(cat "$STUB_LOG")" "DELETE"
+}
+
+test_registry_rm_never_stops_the_registry() {
+  with_cfg; mkrepo p && cd p
+  mkdir -p "$T/xdg/cbde"; printf 'registry=localhost:5000/cbde\n' > "$CFG"
+  run "$CBDE" registry rm
+  assert_rc "$rc" 1; assert_contains "$out" "which tag"
+  STUB_DIGESTS="--purge=none" run "$CBDE" registry rm --purge
+  assert_rc "$rc" 1
+  assert_not_contains "$(cat "$STUB_LOG")" "docker rm -f cbde-registry"
+  assert_file "$CFG"
+}
+
+# ---- matrix list from local images and the registry ------------------------
+test_matrix_list_merges_local_images_and_registry_tags() {
+  with_cfg; mkrepo p && cd p
+  mkdir -p "$T/xdg/cbde"; printf 'registry=localhost:5000/cbde\n' > "$CFG"
+  STUB_TAGS="0.1.0 0.2.0 latest base" STUB_IMAGES="cbde:latest cbde:0.1.0 cbde:0.2.0" STUB_GHC_0_1_0=9.6.6 \
+    STUB_TAGS_JSON='{"tags":["0.2.0","0.3.0","latest"]}' run "$CBDE" matrix list
+  assert_rc "$rc" 0 "$out"
+  assert_match "$out" '^    0\.1\.0 +GHC 9\.6\.6 +cabal 3\.10\.3\.0 +Lean v4\.24\.0 +local$'
+  assert_match "$out" '^  \* 0\.2\.0 +GHC 9\.6\.7 .* local, registry, latest   <- this project$'
+  assert_match "$out" '^    0\.3\.0 +\(in registry, not pulled\) +cbde matrix 0\.3\.0  to use it$'
+  assert_not_contains "$out" "base"
+  assert_contains "$out" "registry: localhost:5000/cbde"
+  assert_not_contains "$(cat "$STUB_LOG")" "docker run" "the list never starts a container"
+}
+
+test_matrix_list_stars_the_project_pin_and_survives_no_registry() {
+  with_cfg; mkrepo p && cd p
+  printf 'matrix=0.1.0\n' > .cbde
+  STUB_TAGS="0.1.0 0.2.0 latest" STUB_IMAGES="cbde:latest cbde:0.1.0 cbde:0.2.0" STUB_TAGS_JSON='{}' run "$CBDE" matrix list
+  assert_rc "$rc" 0 "$out"
+  assert_match "$out" '^  \* 0\.1\.0 .*<- this project$'
+  assert_match "$out" '^    0\.2\.0 .* local, latest$'
+  assert_contains "$out" "(not reachable, or empty)"
+}
+
+test_matrix_list_with_nothing_anywhere() {
+  with_cfg; mkrepo p && cd p
+  STUB_TAGS="" STUB_IMAGES="" STUB_TAGS_JSON='{}' run "$CBDE" matrix list
+  assert_rc "$rc" 0 "$out"
+  assert_contains "$out" "no matrices"
+  assert_contains "$out" "cbde build"
 }
 
 run_tests
