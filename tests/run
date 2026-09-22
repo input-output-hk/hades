@@ -19,7 +19,8 @@ for f in "$here"/*.test.sh; do
 done
 if command -v shellcheck >/dev/null 2>&1; then
   printf '\n\033[1mshellcheck\033[0m\n'
-  (cd "$here/.." && shellcheck -x -s bash bin/cbde cbde cbde-entrypoint cbde-provision lib/matrix.sh) \
+  (cd "$here/.." && shellcheck -x -s bash bin/cbde cbde cbde-entrypoint cbde-provision lib/matrix.sh \
+                 && shellcheck -s sh install.sh) \
     && printf '  ok\n' || status=1
 fi
 printf '\n'

@@ -540,7 +540,7 @@ cmd_build() {
 # Placeholders. Both are documented in the README as coming, so they explain
 # themselves and print the manual equivalent rather than failing as an unknown
 # verb (which would otherwise be run as a command inside the container).
-INSTALL_URL="https://raw.githubusercontent.com/input-output-hk/cbde/main/install.sh"
+INSTALL_URL="https://raw.githubusercontent.com/input-output-hk/hades/main/install.sh"
 
 cmd_upgrade() {
   note "cbde upgrade is not implemented yet."
