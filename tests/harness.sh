@@ -29,7 +29,7 @@ assert_no_file()      { [ ! -e "$1" ] || fail "expected no file: $1"; }
 run() { rc=0; out="$("$@" 2>&1)" || rc=$?; }
 
 # A throwaway git repository in $T, so the launcher's git-root logic engages.
-mkrepo() { git init -q "$1" && (cd "$1" && git -c user.email=t@t -c user.name=t commit -q --allow-empty -m init); }
+mkrepo() { git init -q "$1" && (cd "$1" && git -c user.email=t@t -c user.name=t -c commit.gpgsign=false commit -q --allow-empty -m init); }
 
 run_tests() {
   local t pass=0 failn=0 T
