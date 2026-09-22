@@ -355,8 +355,33 @@ registry_url() { # -> http(s)://host/v2/name
   printf '%s://%s/v2/%s' "$scheme" "$host" "$name"
 }
 have_curl() { command -v curl >/dev/null 2>&1 || die "curl is needed to talk to the registry"; }
+# GET a distribution-API path and print the body. The local registry answers
+# at once. GHCR (and Docker Hub) answer 401 with a Www-Authenticate header that
+# names a token endpoint; a public package hands an anonymous token to anyone
+# who asks there, so fetch one and retry. No docker login is involved: users
+# never need a GitHub account to list or pull a public image.
+registry_get() { # PATH -> body on stdout; fails silently when unreachable
+  local url="$(registry_url)/$1" tmp code challenge realm service scope token
+  tmp="$(mktemp "${TMPDIR:-/tmp}/cbde-http.XXXXXX")" || return 1
+  code="$(curl -sS --max-time 5 -D "$tmp.h" -o "$tmp" -w '%{http_code}' "$url" 2>/dev/null || true)"
+  if [ "$code" = 401 ]; then
+    challenge="$(sed -n 's/^[Ww][Ww][Ww]-[Aa]uthenticate: *[Bb]earer *//p' "$tmp.h" | tr -d '\r' | head -n 1)"
+    realm="$(printf '%s' "$challenge" | sed -n 's/.*realm="\([^"]*\)".*/\1/p')"
+    service="$(printf '%s' "$challenge" | sed -n 's/.*service="\([^"]*\)".*/\1/p')"
+    scope="$(printf '%s' "$challenge" | sed -n 's/.*scope="\([^"]*\)".*/\1/p')"
+    if [ -n "$realm" ]; then
+      token="$(curl -fsS --max-time 5 "$realm?service=$service&scope=$scope" 2>/dev/null \
+        | sed -n 's/.*"\(access_\)\{0,1\}token": *"\([^"]*\)".*/\2/p' | head -n 1 || true)"
+      [ -n "$token" ] && code="$(curl -sS --max-time 5 -o "$tmp" -w '%{http_code}' \
+        -H "Authorization: Bearer $token" "$url" 2>/dev/null || true)"
+    fi
+  fi
+  [ "$code" = 200 ] && cat "$tmp"
+  rm -f "$tmp" "$tmp.h"
+  [ "$code" = 200 ]
+}
 registry_tags() {
-  curl -fsS --max-time 5 "$(registry_url)/tags/list" 2>/dev/null \
+  registry_get tags/list 2>/dev/null \
     | sed -n 's/.*"tags":\[\([^]]*\)\].*/\1/p' | tr -d '"' | tr ',' '\n' | grep . | sort -V || true
 }
 
