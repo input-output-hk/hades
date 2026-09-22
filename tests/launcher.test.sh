@@ -357,6 +357,26 @@ test_registry_status_and_unknown_subcommand() {
   assert_rc "$rc" 1; assert_contains "$out" "unknown registry subcommand"
 }
 
+test_registry_list_does_the_token_handshake_anonymously() {
+  # GHCR: 401 + Www-Authenticate, then an anonymous token, then the tags.
+  with_cfg; mkrepo p && cd p
+  STUB_REGISTRY_AUTH=1 STUB_TAGS_JSON='{"tags":["0.2.0","latest"]}' run "$CBDE" registry list
+  assert_rc "$rc" 0
+  assert_contains "$out" "ghcr.io/input-output-hk/cbde:0.2.0"
+  assert_contains "$out" "ghcr.io/input-output-hk/cbde:latest"
+  log="$(cat "$STUB_LOG")"
+  assert_contains "$log" "https://ghcr.io/token?service=ghcr.io&scope=repository:x/cbde:pull"
+  assert_contains "$log" "Authorization: Bearer t0k"
+  assert_not_contains "$log" "-u "                      # no credentials, ever
+}
+
+test_registry_list_without_challenge_makes_one_request() {
+  with_cfg; mkrepo p && cd p
+  STUB_TAGS_JSON='{"tags":["0.2.0"]}' run "$CBDE" registry list
+  assert_rc "$rc" 0
+  assert_eq "$(grep -c '^curl' "$STUB_LOG")" 1
+}
+
 test_registry_list_prints_tags_version_sorted() {
   with_cfg; mkrepo p && cd p
   mkdir -p "$T/xdg/cbde"; printf 'registry=localhost:5000/cbde\n' > "$CFG"

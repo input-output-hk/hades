@@ -1,33 +1,53 @@
 #!/usr/bin/env bash
-# Fake curl for the registry tests. Answers the OCI distribution calls the
-# launcher makes; everything is driven by env:
-#   STUB_TAGS_JSON   tags/list body, default {"tags":["0.2.0","latest"]}
-#   STUB_DIGESTS     "tag=digest ..." for manifests/<tag>; default: all share sha256:aaa
-#   STUB_DELETE_CODE HTTP code for DELETE, default 202
+# Fake curl for the registry and installer tests. Answers the OCI distribution
+# calls the launcher makes; everything is driven by env:
+#   STUB_TAGS_JSON      tags/list body, default {"tags":["0.2.0","latest"]}
+#   STUB_DIGESTS        "tag=digest ..." for manifests/<tag>; default: all share sha256:aaa
+#   STUB_DELETE_CODE    HTTP code for DELETE, default 202
+#   STUB_REGISTRY_AUTH  1 -> behave like GHCR: 401 + Www-Authenticate until the
+#                       request carries "Authorization: Bearer t0k"; the token
+#                       endpoint hands out t0k
 # The installer's fetch of bin/cbde is served from a file:
-#   STUB_CURL_FILE   body for any .../bin/cbde URL; STUB_CURL_FAIL=1 -> exit 22
+#   STUB_CURL_FILE      body for any .../bin/cbde or file:// URL; STUB_CURL_FAIL=1 -> exit 22
 printf 'curl %s\n' "$*" >> "${STUB_LOG:-/dev/null}"
-url=; method=GET; want_code=; dump_headers=
+url=; method=GET; want_code=; hdr_to=; body_to=; fail=; bearer=
 while [ $# -gt 0 ]; do
   case "$1" in
     -X) method="$2"; shift ;;
     -w) want_code=1; shift ;;
-    -D) dump_headers=1; shift ;;
-    -o|-H|--max-time) shift ;;
+    -D) hdr_to="$2"; shift ;;
+    -o) body_to="$2"; shift ;;
+    -H) case "$2" in "Authorization: Bearer "*) bearer="${2#Authorization: Bearer }" ;; esac; shift ;;
+    --max-time) shift ;;
+    -f*|-*f*) fail=1 ;;
     http://*|https://*|file://*) url="$1" ;;
   esac
   shift
 done
+[ -n "$fail" ] || case "$*" in *" -fsS"*|*" -f "*) fail=1 ;; esac
+code=200; headers=; body=
 case "$method $url" in
   "GET "*/bin/cbde|"GET file://"*)
     [ -n "${STUB_CURL_FAIL:-}" ] && exit 22
-    cat "${STUB_CURL_FILE:?}" ;;
-  "GET "*/tags/list) printf '%s' "${STUB_TAGS_JSON:-{\"tags\":[\"0.2.0\",\"latest\"]\}}" ;;
+    body="$(cat "${STUB_CURL_FILE:?}")" ;;
+  "GET "*/token?*)
+    body='{"token":"t0k"}' ;;
+  "GET "*/tags/list)
+    if [ -n "${STUB_REGISTRY_AUTH:-}" ] && [ "$bearer" != t0k ]; then
+      code=401; headers='Www-Authenticate: Bearer realm="https://ghcr.io/token",service="ghcr.io",scope="repository:x/cbde:pull"'
+      body='{"errors":[{"code":"UNAUTHORIZED"}]}'
+    else
+      body="${STUB_TAGS_JSON:-{\"tags\":[\"0.2.0\",\"latest\"]\}}"
+    fi ;;
   "GET "*/manifests/*)
     tag="${url##*/}"; digest=sha256:aaa
     for kv in ${STUB_DIGESTS:-}; do [ "${kv%%=*}" = "$tag" ] && digest="${kv#*=}"; done
-    [ "$digest" = none ] && exit 22
-    [ -n "$dump_headers" ] && printf 'HTTP/1.1 200 OK\r\nDocker-Content-Digest: %s\r\n\r\n' "$digest" ;;
-  "DELETE "*) [ -n "$want_code" ] && printf '%s' "${STUB_DELETE_CODE:-202}" ;;
+    if [ "$digest" = none ]; then code=404; else headers="Docker-Content-Digest: $digest"; fi ;;
+  "DELETE "*) code="${STUB_DELETE_CODE:-202}" ;;
 esac
+emit_headers() { printf 'HTTP/1.1 %s\r\n' "$code"; [ -n "$headers" ] && printf '%s\r\n' "$headers"; printf '\r\n'; }
+case "$hdr_to" in "") ;; -) emit_headers ;; *) emit_headers > "$hdr_to" ;; esac
+case "$body_to" in "") [ -n "$body" ] && printf '%s' "$body" ;; *) printf '%s' "$body" > "$body_to" ;; esac
+[ -n "$want_code" ] && printf '%s' "$code"
+[ -n "$fail" ] && [ "$code" -ge 400 ] && exit 22
 exit 0
