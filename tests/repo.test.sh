@@ -57,7 +57,8 @@ test_dockerfile_builds_and_ships_the_toolchain_seed() {
 }
 
 test_devcontainer_template_targets_latest_and_is_stamped() {
-  local dc="$REPO/.devcontainer/devcontainer.json"
+  local dc="$REPO/templates/devcontainer.json"
+  assert_no_file "$REPO/.devcontainer" "the checkout is the tool, not a project: no live devcontainer here"
   assert_contains "$(cat "$dc")" '"image": "cbde:latest"'
   assert_contains "$(cat "$dc")" '"//cbde-template": "dev"'
   assert_contains "$(cat "$dc")" 'source=cbde-data,target=/nix,type=volume'

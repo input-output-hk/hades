@@ -40,7 +40,9 @@ run_tests() {
          trap 'fail "aborted: command failed at ${BASH_SOURCE[1]:-?}:${BASH_LINENO[0]:-?}"' ERR
          export T STUB_LOG="$T/stub.log"
          cd "$T"
-         "$t"
+         # stdin from /dev/null: a test must never see the terminal, or a
+         # prompt (`[ -t 0 ]`) waits for the person running the suite.
+         "$t" </dev/null
          [ -z "$_failed" ] ) 2>"$T.err"; then
       pass=$((pass + 1)); printf 'ok\n'
     else
