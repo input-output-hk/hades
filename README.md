@@ -23,20 +23,41 @@ Those run in the container against the project in your current directory. No
 
 ## Install
 
-> 🚧 **Placeholder.** The one-liner below is the shape of the installer, not a
-> live URL — the repo is not published yet, so nothing is served at that
-> address. Until it is, use [from a checkout](#install-from-a-checkout).
+> 🚧 **Testing phase.** The installer is on the `feat/curl-install` branch,
+> and the lines below fetch it from there. When it is merged, `feat/curl-install`
+> becomes `main` in both places and `CBDE_REF=` goes away.
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/input-output-hk/cbde/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/input-output-hk/hades/feat/curl-install/install.sh \
+  | CBDE_REF=feat/curl-install sh
 ```
 
-That will drop the `cbde` launcher into `~/.local/bin`, pull the image, and
-create the volume. Then:
+That drops the `cbde` launcher into `~/.local/bin` (or `$CBDE_INSTALL_DIR`,
+or `--dir`) and tells you if that directory is not on your PATH. Nothing else
+happens until you run it:
 
 ```bash
-cbde doctor       # confirm it works
+cbde doctor       # first run pulls the image and fills the volume
 ```
+
+Running the same line again updates the launcher in place.
+
+### Try it without installing
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/input-output-hk/hades/feat/curl-install/install.sh \
+  | CBDE_REF=feat/curl-install sh -s -- --try
+```
+
+This opens your usual shell (bash, zsh or fish) with `cbde` defined as a shell
+function and a `[cbde try]` marker on the prompt. Your own rc files are still
+loaded. Use `cbde` as normal; when you `exit`, the function is gone and
+nothing has been written to disk. The image and the `cbde-data` volume, if
+that session created them, stay in Docker, so installing later starts warm.
+
+Because it is a function rather than a file on PATH, scripts and other
+programs cannot call it. That is fine for trying things out; install for
+anything more.
 
 To remove everything again — launcher, image, and the volume with every cached
 toolchain in it — there is one verb, and it means what it says:
@@ -745,6 +766,7 @@ Everything below is for people changing CBDE itself. Users never need it.
 | `templates/devcontainer.json` | the dev-container template copied into the image; `cbde devcontainer` writes it into user projects |
 | `lib/matrix.sh` | matrix reading and validation, the `active_*` probes, and the seeded installers (`ghcup_install`, `lean_install`, `cabal_index_install`) |
 | `bin/cbde` | the host launcher: `docker run` wrapper, pins, `matrix`, `registry`, `build`, `pull` |
+| `install.sh` | the `curl \| sh` installer: copies `bin/cbde` to `~/.local/bin`, or with `--try` opens a shell where `cbde` is a function |
 | `cbde` | the in-container CLI: version switching, `matrix`, `doctor`, `devcontainer` |
 | `cbde-entrypoint` | adopts the host uid, then provisions |
 | `cbde-provision` | fills the volume from the seed or the network on every start; idempotent |
@@ -832,6 +854,28 @@ To publish for real, `docker login ghcr.io` with a token that has
 `write:packages`, then `CBDE_REGISTRY=ghcr.io/input-output-hk/cbde cbde registry push`.
 A new GHCR package is private by default; make it public or `cbde pull` needs a
 login on every machine.
+
+### Testing the installer
+
+`install.sh` fetches one file, `bin/cbde`, from GitHub. Which one is chosen
+by `--repo` / `$CBDE_REPO` (default `input-output-hk/hades`) and `--ref` /
+`$CBDE_REF` (default `main`), so a branch can be tried before it is merged:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/input-output-hk/hades/feat/x/install.sh \
+  | CBDE_REF=feat/x sh -s -- --try
+```
+
+Both the installer's URL and `CBDE_REF` name the branch: the first fetches
+the installer, the second tells it where to fetch the launcher. For changes
+that are not pushed yet, skip the network entirely:
+
+```bash
+CBDE_SOURCE=file://$PWD/bin/cbde sh install.sh --try
+CBDE_SOURCE=file://$PWD/bin/cbde sh install.sh --dir /tmp/bin
+```
+
+`CBDE_SOURCE` is the full URL of the launcher and overrides repo and ref.
 
 ### Tests
 
