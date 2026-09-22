@@ -73,7 +73,7 @@ and `cbde registry status` are the sources.
   d7df730 feat: local dev registry, per-user config, live matrix list
   a82b112 feat: compatibility matrices, image-seeded toolchains, unit tests
   1d16fd9 feat(macos): native multi-arch image, Rosetta only for nix x86_64
-- Tests: 115 across six suites (`inner`, `install`, `launcher`, `matrix`, `repo`,
+- Tests: 117 across six suites (`inner`, `install`, `launcher`, `matrix`, `repo`,
   `seed`). On this Mac two fail for reasons unrelated to the launcher
   (`matrix: test_validate_rejects_malformed_files` — `[!A-Z_]` accepts a
   lowercase key under the UTF-8 locale; `seed: test_index_corrupt_seed_falls_back_unless_strict`

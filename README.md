@@ -830,7 +830,7 @@ runs the standard `registry:2` image for that and remembers to use it:
 cbde registry up           # starts localhost:5000, points cbde at it
 cbde registry push         # pushes every local cbde:<version> (and latest) into it; asks first
 cbde registry list         # tags it holds
-cbde registry rm 0.1.0     # remove a tag (asks first when other tags share the same image)
+cbde registry rm 0.1.0     # remove a tag and its arch sources (asks first when other tags share the image)
 cbde registry status       # what runs, what cbde uses, which tags it holds
 cbde registry down         # stops it, cbde is back on GHCR (blobs kept; --purge deletes them)
 ```
@@ -899,6 +899,12 @@ the multi-arch one. A new GHCR package is private by default; make it public
 or `cbde pull` needs a login on every machine. `docker buildx` is required
 (Docker Desktop and Colima ship it); it talks plain HTTP to `localhost`, so
 the flow works unchanged against the local registry.
+
+When only one side has been pushed, the plan reads `= amd64`: the index is
+rewritten with that single architecture, so an existing single-arch tag with
+the same content is replaced by an equivalent one. Nothing is lost; the other
+side is added when the other machine pushes. `cbde registry rm <version>` on
+the local registry removes the index together with its arch sources.
 
 ### Testing the installer
 

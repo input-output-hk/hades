@@ -530,6 +530,46 @@ test_registry_rm_errors_are_explained() {
   assert_not_contains "$(cat "$STUB_LOG")" "DELETE"
 }
 
+test_registry_rm_takes_the_arch_sources_with_the_index() {
+  with_cfg; mkrepo p && cd p
+  mkdir -p "$T/xdg/cbde"; printf 'registry=localhost:5000/cbde\n' > "$CFG"
+  # 0.1.0 is an index over its two sources; nothing else shares them: no prompt.
+  STUB_TAGS_JSON='{"tags":["0.1.0","0.1.0-amd64","0.1.0-arm64","0.2.0"]}' \
+    STUB_DIGESTS="0.1.0=sha256:i1 0.1.0-amd64=sha256:a1 0.1.0-arm64=sha256:b1 0.2.0=sha256:i2" \
+    run "$CBDE" registry rm 0.1.0
+  assert_rc "$rc" 0 "$out"
+  assert_contains "$out" "0.1.0 has arch sources: 0.1.0-amd64 0.1.0-arm64"
+  assert_not_contains "$out" "shares its image"
+  assert_contains "$out" "removed localhost:5000/cbde:0.1.0 (and 0.1.0-amd64 0.1.0-arm64)"
+  log="$(cat "$STUB_LOG")"
+  assert_contains "$log" "-X DELETE http://localhost:5000/v2/cbde/manifests/sha256:i1"
+  assert_contains "$log" "-X DELETE http://localhost:5000/v2/cbde/manifests/sha256:a1"
+  assert_contains "$log" "-X DELETE http://localhost:5000/v2/cbde/manifests/sha256:b1"
+  assert_not_contains "$log" "manifests/sha256:i2"
+}
+
+test_registry_rm_reports_latest_and_its_sources_as_shared() {
+  with_cfg; mkrepo p && cd p
+  mkdir -p "$T/xdg/cbde"; printf 'registry=localhost:5000/cbde\n' > "$CFG"
+  # latest was built from the same sources: same index digest, same source digests.
+  export STUB_TAGS_JSON='{"tags":["0.2.0","0.2.0-amd64","0.2.0-arm64","latest","latest-amd64","latest-arm64"]}'
+  export STUB_DIGESTS="0.2.0=sha256:i 0.2.0-amd64=sha256:a 0.2.0-arm64=sha256:b latest=sha256:i latest-amd64=sha256:a latest-arm64=sha256:b"
+  run "$CBDE" registry rm 0.2.0
+  assert_rc "$rc" 1
+  assert_contains "$out" "0.2.0 shares its image with: latest latest-amd64 latest-arm64"
+  assert_not_contains "$(cat "$STUB_LOG")" "DELETE"
+  : > "$STUB_LOG"
+  run "$CBDE" registry rm 0.2.0 --yes
+  assert_rc "$rc" 0 "$out"
+  assert_eq "$(grep -c -- '-X DELETE' "$STUB_LOG")" 3
+  # removing just one side leaves the index and the other side alone
+  : > "$STUB_LOG"
+  run "$CBDE" registry rm 0.2.0-arm64 --yes
+  assert_rc "$rc" 0 "$out"
+  assert_eq "$(grep -c -- '-X DELETE' "$STUB_LOG")" 1
+  assert_contains "$(cat "$STUB_LOG")" "manifests/sha256:b"
+}
+
 test_registry_rm_never_stops_the_registry() {
   with_cfg; mkrepo p && cd p
   mkdir -p "$T/xdg/cbde"; printf 'registry=localhost:5000/cbde\n' > "$CFG"
