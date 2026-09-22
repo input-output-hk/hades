@@ -370,7 +370,7 @@ remote_arches() {
 # The platforms an index serves, one line: "linux/amd64 linux/arm64".
 remote_platforms() {
   docker buildx imagetools inspect --format '{{range .Manifest.Manifests}}{{.Platform.OS}}/{{.Platform.Architecture}} {{end}}' "$1" 2>/dev/null \
-    | tr ' ' '\n' | grep -v '^unknown/\|^$' | tr '\n' ' ' | sed 's/ $//' || true
+    | tr ' ' '\n' | grep -v -e '^unknown/' -e '^$' | tr '\n' ' ' | sed 's/ $//' || true
 }
 
 cmd_registry_push() {
@@ -500,37 +500,60 @@ cmd_registry_list() {
 # Remove one tag from the local registry. Registries delete by manifest, so
 # every tag that points at the same image goes with it (typically <version>
 # and latest); the user is told which before anything happens.
+# The digest a tag points at, or nothing.
+tag_digest() {
+  curl -fsS --max-time 5 -o /dev/null -D - \
+    -H 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json' \
+    "$(registry_url)/manifests/$1" 2>/dev/null | sed -n 's/^[Dd]ocker-[Cc]ontent-[Dd]igest: *//p' | tr -d '\r' || true
+}
+
 cmd_registry_rm() {
   have_curl; have_docker
-  local tag="${1:-}" digest others
+  local tag="${1:-}" all digest digests sources='' others t a d code
   [ -n "$tag" ] || die "registry rm: which tag? (cbde registry list)"
   [ "$REGISTRY" = "$LOCAL_REGISTRY" ] \
     || die "registry rm works on the local registry only; $REGISTRY is managed elsewhere (GHCR: the package's settings page)"
-  digest="$(curl -fsS --max-time 5 -o /dev/null -D - \
-      -H 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json' \
-      "$(registry_url)/manifests/$tag" 2>/dev/null | sed -n 's/^[Dd]ocker-[Cc]ontent-[Dd]igest: *//p' | tr -d '\r' || true)"
+  all="$(registry_tags)"
+  digest="$(tag_digest "$tag")"
   [ -n "$digest" ] || die "no tag $tag in $REGISTRY (cbde registry list)"
-  # Which other tags share the manifest?
-  others="$(for t in $(registry_tags); do
+  digests="$digest"
+  # A version's arch sources (0.2.0-amd64, 0.2.0-arm64) go with it: alone they
+  # are useless, and the next push recreates them anyway.
+  case "$tag" in *-amd64|*-arm64) ;; *)
+    for a in $ARCHES; do
+      printf '%s\n' "$all" | grep -qx "$tag-$a" || continue
+      d="$(tag_digest "$tag-$a")"; [ -n "$d" ] || continue
+      sources="$sources$tag-$a "
+      case " $digests " in *" $d "*) ;; *) digests="$digests $d" ;; esac
+    done ;;
+  esac
+  # Registries delete by manifest, so every other tag on one of these digests
+  # goes too (typically latest and its sources); the user is told which.
+  others="$(for t in $all; do
       [ "$t" = "$tag" ] && continue
-      d="$(curl -fsS --max-time 5 -o /dev/null -D - -H 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json' "$(registry_url)/manifests/$t" 2>/dev/null | sed -n 's/^[Dd]ocker-[Cc]ontent-[Dd]igest: *//p' | tr -d '\r' || true)"
-      [ "$d" = "$digest" ] && printf '%s ' "$t"
+      case " $sources" in *" $t "*) continue ;; esac
+      d="$(tag_digest "$t")"
+      case " $digests " in *" $d "*) printf '%s ' "$t" ;; esac
     done; true)"
+  [ -z "$sources" ] || printf 'cbde: %s has arch sources: %s— removing them too.\n' "$tag" "$sources" >&2
   if [ -n "$others" ] && [ "${2:-}" != --yes ]; then
     printf 'cbde: %s shares its image with: %s — removing it removes those too.\n' "$tag" "$others" >&2
     if [ -t 0 ]; then
-      printf 'continue? [y/N] ' >&2; local a; read -r a
+      printf 'continue? [y/N] ' >&2; read -r a
       case "$a" in y|Y|yes) ;; *) printf 'aborted\n' >&2; return 1 ;; esac
     else
       die "re-run with: cbde registry rm $tag --yes"
     fi
   fi
-  local code; code="$(curl -sS --max-time 10 -o /dev/null -w '%{http_code}' -X DELETE "$(registry_url)/manifests/$digest")"
-  case "$code" in
-    202) printf 'cbde: removed %s:%s%s\n' "$REGISTRY" "$tag" "${others:+ (and $others)}" >&2 ;;
-    405) die "this registry has deletes disabled — recreate it once with: cbde registry down && cbde registry up" ;;
-    *)   die "delete failed (HTTP $code)" ;;
-  esac
+  for d in $digests; do
+    code="$(curl -sS --max-time 10 -o /dev/null -w '%{http_code}' -X DELETE "$(registry_url)/manifests/$d")"
+    case "$code" in
+      202) ;;
+      405) die "this registry has deletes disabled — recreate it once with: cbde registry down && cbde registry up" ;;
+      *)   die "delete failed (HTTP $code)" ;;
+    esac
+  done
+  printf 'cbde: removed %s:%s%s%s\n' "$REGISTRY" "$tag" "${sources:+ (and ${sources% })}" "${others:+ (and $others)}" >&2
   # Unreferenced blobs stay on disk until garbage-collected.
   docker exec "$LOCAL_REGISTRY_NAME" registry garbage-collect --delete-untagged /etc/docker/registry/config.yml >/dev/null 2>&1 \
     && printf 'cbde: garbage-collected the registry volume\n' >&2 || true
