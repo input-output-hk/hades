@@ -4,6 +4,7 @@
 #   STUB_TAGS_JSON      tags/list body, default {"tags":["0.2.0","latest"]}
 #   STUB_DIGESTS        "tag=digest ..." for manifests/<tag>; default: all share sha256:aaa
 #   STUB_DELETE_CODE    HTTP code for DELETE, default 202
+#   STUB_PORT_TAKEN     1 -> GET /v2/ answers like macOS AirPlay: 403, Server: AirTunes
 #   STUB_REGISTRY_AUTH  1 -> behave like GHCR: 401 + Www-Authenticate until the
 #                       request carries "Authorization: Bearer t0k"; the token
 #                       endpoint hands out t0k
@@ -30,6 +31,9 @@ case "$method $url" in
   "GET "*/bin/cbde|"GET file://"*)
     [ -n "${STUB_CURL_FAIL:-}" ] && exit 22
     body="$(cat "${STUB_CURL_FILE:?}")" ;;
+  "GET "*/v2/)
+    if [ -n "${STUB_PORT_TAKEN:-}" ]; then code=403; headers='Server: AirTunes/870.14.1'
+    else headers='Docker-Distribution-Api-Version: registry/2.0'; body='{}'; fi ;;
   "GET "*/token?*)
     body='{"token":"t0k"}' ;;
   "GET "*/tags/list)

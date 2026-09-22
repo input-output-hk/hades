@@ -62,7 +62,7 @@ follows is the short version plus the things that bit us.
 - His registry/volume state on this machine is real: don't wipe `cbde-data`
   or the local registry without saying so; use `cbde-scratch` volumes.
 
-## State snapshot (2026-09-22)
+## State snapshot (2026-09-22, evening)
 
 Refresh this section when it drifts; `git log`, `tests/run`, `docker images cbde`
 and `cbde registry status` are the sources.
@@ -73,21 +73,35 @@ and `cbde registry status` are the sources.
   d7df730 feat: local dev registry, per-user config, live matrix list
   a82b112 feat: compatibility matrices, image-seeded toolchains, unit tests
   1d16fd9 feat(macos): native multi-arch image, Rosetta only for nix x86_64
-- Tests: 106 across six suites (`inner`, `install`, `launcher`, `matrix`, `repo`,
-  `seed`),
-  all passing. Sizes: `bin/cbde` ~600 lines, `cbde` ~575, `lib/matrix.sh` ~310,
-  `cbde-provision` ~215.
+- Tests: 115 across six suites (`inner`, `install`, `launcher`, `matrix`, `repo`,
+  `seed`). On this Mac two fail for reasons unrelated to the launcher
+  (`matrix: test_validate_rejects_malformed_files` — `[!A-Z_]` accepts a
+  lowercase key under the UTF-8 locale; `seed: test_index_corrupt_seed_falls_back_unless_strict`
+  — a corrupt `.tar.xz` is not caught by the seed path); CI on Linux is the
+  reference. shellcheck is not installed here. Sizes: `bin/cbde` ~700 lines,
+  `cbde` ~575, `lib/matrix.sh` ~310, `cbde-provision` ~215.
+- `cbde registry push` is multi-arch aware: pushes `cbde:T` as `$REGISTRY:T-<arch>`
+  (arch from `docker image inspect`), probes `T-amd64`/`T-arm64` with
+  `docker buildx imagetools inspect`, rewrites `T` with `imagetools create`
+  from every arch tag present, reads it back. Prints a plan and asks; `--yes`
+  when stdin is not a tty. `registry list` nests arch tags, `is_version`
+  rejects them so `matrix list` ignores them. Local `cbde:<v>-<arch>` tags
+  (from a `cbde pull 0.2.0-arm64`) are never pushed.
 - Matrices: `0.2.0` (GHC 9.6.7, the real one) and `0.1.0` (GHC 9.6.6, exists
   to exercise switching; never becomes `latest`). Both differ only in GHC.
 - Local images: `cbde:0.2.0` = `cbde:latest` and `cbde:0.1.0`, each 3.7 GB
   unpacked / ~1.14 GB compressed, seeds included. `cbde:base`, `cbde:next`
   and `cbde:pre-slim` (16.7 GB) are leftovers from before the matrices and
   can be removed.
-- Local dev registry is **running** (`cbde-registry`, :5000) and
-  `~/.config/cbde/config` points cbde at it; it holds `0.1.0`, `0.2.0`,
-  `latest`. `cbde registry down` returns to GHCR. Nothing is on GHCR yet;
-  Bogdan has push rights to `ghcr.io/input-output-hk/cbde` (verified with a
-  cancelled upload session, no package created).
+- Local dev registry is **not running** and `~/.config/cbde/config` does not
+  exist (cbde uses GHCR); its blobs are in volume `cbde-registry-data`
+  (holds `0.2.0` index + `0.2.0-arm64` from the 2026-09-22 check). **Port 5000
+  is taken by AirPlay Receiver on this Mac** (Control Center answers 403):
+  use `CBDE_LOCAL_REGISTRY_PORT=5001` for `registry up/push/list/down`;
+  `registry up` warns about it.
+  The amd64 `0.2.0` is on GHCR, pushed from Linux before the multi-arch
+  push existed; the arm64 side has not been pushed (Bogdan does that after
+  review, with `CBDE_REGISTRY=ghcr.io/input-output-hk/cbde cbde registry push 0.2.0`).
 - `.cbde` and `CLAUDE.md` are gitignored in this repo. The devcontainer
   template lives at `templates/devcontainer.json`; no `.devcontainer/` here.
 - A fresh volume with `--network none` provisions GHC, cabal, Lean and the
