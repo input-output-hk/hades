@@ -120,7 +120,8 @@ Toolchain (forwarded to cbde inside the container):
 
 Host side:
   cbde registry up|down       run a local registry on :$LOCAL_REGISTRY_PORT and point cbde at it / undo
-  cbde registry push [m...]   push local cbde:<matrix> images to the current registry
+  cbde registry push [m...]   push local cbde:<matrix> images to the current registry as
+                              <m>-<arch> and merge them into the multi-arch tag <m> (--yes: no prompt)
   cbde registry list          tags in the current registry
   cbde registry rm <tag>      remove a tag from the local registry (and the tags sharing its image)
   cbde registry status        what is running, what cbde uses, what it holds
@@ -311,9 +312,23 @@ cmd_registry_up() {
     printf 'cbde: local registry started on :%s (blobs kept in volume %s-data)\n' "$LOCAL_REGISTRY_PORT" "$LOCAL_REGISTRY_NAME" >&2
   fi
   cfg_set registry "$LOCAL_REGISTRY"
+  local_registry_reachable
   printf 'cbde: registry is now %s  (%s)\n' "$LOCAL_REGISTRY" "$CFG" >&2
   [ -z "${CBDE_REGISTRY:-}" ] || note "cbde: CBDE_REGISTRY=$CBDE_REGISTRY is set in this shell and overrides the file"
   printf 'cbde: publish your local images into it with:  cbde registry push\n' >&2
+}
+
+# Is it the registry that answers on the host's port? On macOS, AirPlay
+# Receiver (Control Center) holds :5000 and answers every request 403; the
+# push then works (the daemon reaches the container from inside the VM) but
+# buildx and curl on the host talk to AirPlay. Say so instead of "no tags".
+local_registry_reachable() {
+  command -v curl >/dev/null 2>&1 || return 0
+  local hdr; hdr="$(curl -sS --max-time 5 -o /dev/null -D - "http://localhost:$LOCAL_REGISTRY_PORT/v2/" 2>/dev/null || true)"
+  case "$hdr" in *[Rr]egistry/2.0*) return 0 ;; esac
+  note "cbde: something else answers on localhost:$LOCAL_REGISTRY_PORT (not the registry)$(printf '%s' "$hdr" | sed -n 's/^[Ss]erver: */ — Server: /p' | tr -d '\r' | head -n 1)"
+  note "cbde: on macOS that is usually AirPlay Receiver; turn it off (System Settings > General > AirDrop & Handoff) or use another port:"
+  note "cbde:   cbde registry down && CBDE_LOCAL_REGISTRY_PORT=5001 cbde registry up   (keep the variable exported for push/list/down)"
 }
 
 cmd_registry_down() {
@@ -333,16 +348,92 @@ cmd_registry_down() {
 
 # Push local cbde:<tag> images to $REGISTRY. Default: every version tag plus
 # latest, so `cbde pull` and `cbde matrix <name>` find them there.
+#
+# The published image is multi-arch (amd64 built on Linux, arm64 on Apple
+# Silicon) but a local image is one architecture, and a plain `docker push`
+# of cbde:T would replace whatever is at $REGISTRY:T with this machine's side.
+# So each side goes up under an arch tag, T-amd64 or T-arm64, and T itself is
+# rewritten as an index over every arch tag that exists — the same merge CI
+# does with `imagetools create`. A Linux box and a Mac can push in either
+# order, and re-pushing one side is idempotent. The arch tags stay in the
+# registry: they are the sources the index points at.
+ARCHES="amd64 arm64"
+have_buildx() { docker buildx version >/dev/null 2>&1 || die "docker buildx is needed for a multi-arch push (Docker Desktop and Colima ship it)"; }
+image_arch()  { docker image inspect -f '{{.Architecture}}' "$1" 2>/dev/null || true; }
+remote_ref_exists() { docker buildx imagetools inspect "$1" >/dev/null 2>&1; }
+# Which of T-amd64 / T-arm64 are in the registry, space-separated.
+remote_arches() {
+  local a out=
+  for a in $ARCHES; do remote_ref_exists "$REGISTRY:$1-$a" && out="$out$a "; done
+  printf '%s' "${out% }"
+}
+# The platforms an index serves, one line: "linux/amd64 linux/arm64".
+remote_platforms() {
+  docker buildx imagetools inspect --format '{{range .Manifest.Manifests}}{{.Platform.OS}}/{{.Platform.Architecture}} {{end}}' "$1" 2>/dev/null \
+    | tr ' ' '\n' | grep -v -e '^unknown/' -e '^$' | tr '\n' ' ' | sed 's/ $//' || true
+}
+
 cmd_registry_push() {
-  have_docker
-  local tags="$*" t
-  [ -n "$tags" ] || tags="$(docker images cbde --format '{{.Tag}}' | grep -E '^([0-9]+\.[0-9]+\.[0-9]+.*|latest)$' | sort -u | tr '\n' ' ')"
+  have_docker; have_buildx
+  local yes='' explicit='' tags='' t arch have plan=() p a parts existing
+  for t; do case "$t" in --yes|-y) yes=1 ;; *) explicit="$explicit $t" ;; esac; done
+  tags="${explicit# }"
+  # Local arch-suffixed tags (from a `cbde pull 0.2.0-arm64`) are sides, not
+  # matrices: never push them as 0.2.0-arm64-arm64.
+  [ -n "$tags" ] || tags="$(docker images cbde --format '{{.Tag}}' | grep -E '^([0-9]+\.[0-9]+\.[0-9]+.*|latest)$' \
+                              | grep -Ev -- '-(amd64|arm64)$' | sort -u | tr '\n' ' ' || true)"
   [ -n "$tags" ] || die "no local cbde:<version> images to push (cbde build first)"
+
   for t in $tags; do
     docker image inspect "cbde:$t" >/dev/null 2>&1 || die "no local image cbde:$t"
-    docker tag "cbde:$t" "$REGISTRY:$t"
-    docker push ${PLATFORM:+--platform "$PLATFORM"} "$REGISTRY:$t" || die "push of $REGISTRY:$t failed"
-    printf 'cbde: pushed %s:%s\n' "$REGISTRY" "$t" >&2
+    arch="$(image_arch "cbde:$t")"
+    case "$arch" in amd64|arm64) ;; *) die "cbde:$t has architecture '$arch'; only amd64 and arm64 are published" ;; esac
+    have="$(remote_arches "$t")"
+    plan+=("$t|$arch|$have")
+  done
+
+  # The plan, then the question. Never a surprise rewrite of a shared tag.
+  printf 'cbde: will push\n' >&2
+  for p in "${plan[@]}"; do
+    IFS='|' read -r t arch have <<< "$p"
+    printf '  %-20s ->  %s:%s-%s\n' "cbde:$t ($arch)" "$REGISTRY" "$t" "$arch" >&2
+  done
+  printf 'then rewrite\n' >&2
+  for p in "${plan[@]}"; do
+    IFS='|' read -r t arch have <<< "$p"
+    parts=
+    for a in $ARCHES; do
+      if [ "$a" = "$arch" ]; then
+        case " $have " in *" $a "*) parts="$parts + $a (replaced)" ;; *) parts="$parts + $a" ;; esac
+      else
+        case " $have " in *" $a "*) parts="$parts + $a (already there)" ;; esac
+      fi
+    done
+    printf '  %-36s = %s\n' "$REGISTRY:$t" "${parts# + }" >&2
+  done
+  if [ -z "$yes" ]; then
+    if [ -t 0 ]; then
+      printf 'continue? [y/N] ' >&2; read -r a
+      case "$a" in y|Y|yes) ;; *) printf 'aborted\n' >&2; return 1 ;; esac
+    else
+      die "re-run with: cbde registry push${explicit} --yes"
+    fi
+  fi
+
+  for p in "${plan[@]}"; do
+    IFS='|' read -r t arch have <<< "$p"
+    docker tag "cbde:$t" "$REGISTRY:$t-$arch"
+    docker push "$REGISTRY:$t-$arch" || die "push of $REGISTRY:$t-$arch failed"
+    printf 'cbde: pushed %s:%s-%s\n' "$REGISTRY" "$t" "$arch" >&2
+    # The index, rebuilt from every arch tag now present (ours included).
+    existing=
+    for a in $ARCHES; do
+      case " $have $arch " in *" $a "*) existing="$existing $REGISTRY:$t-$a" ;; esac
+    done
+    # shellcheck disable=SC2086
+    docker buildx imagetools create -t "$REGISTRY:$t" $existing || die "could not write the index $REGISTRY:$t"
+    remote_ref_exists "$REGISTRY:$t" || die "$REGISTRY:$t was written but cannot be read back"
+    printf 'cbde: %s:%s now serves: %s\n' "$REGISTRY" "$t" "$(remote_platforms "$REGISTRY:$t")" >&2
   done
 }
 
@@ -355,52 +446,114 @@ registry_url() { # -> http(s)://host/v2/name
   printf '%s://%s/v2/%s' "$scheme" "$host" "$name"
 }
 have_curl() { command -v curl >/dev/null 2>&1 || die "curl is needed to talk to the registry"; }
+# GET a distribution-API path and print the body. The local registry answers
+# at once. GHCR (and Docker Hub) answer 401 with a Www-Authenticate header that
+# names a token endpoint; a public package hands an anonymous token to anyone
+# who asks there, so fetch one and retry. No docker login is involved: users
+# never need a GitHub account to list or pull a public image.
+registry_get() { # PATH -> body on stdout; fails silently when unreachable
+  local url="$(registry_url)/$1" tmp code challenge realm service scope token
+  tmp="$(mktemp "${TMPDIR:-/tmp}/cbde-http.XXXXXX")" || return 1
+  code="$(curl -sS --max-time 5 -D "$tmp.h" -o "$tmp" -w '%{http_code}' "$url" 2>/dev/null || true)"
+  if [ "$code" = 401 ]; then
+    challenge="$(sed -n 's/^[Ww][Ww][Ww]-[Aa]uthenticate: *[Bb]earer *//p' "$tmp.h" | tr -d '\r' | head -n 1)"
+    realm="$(printf '%s' "$challenge" | sed -n 's/.*realm="\([^"]*\)".*/\1/p')"
+    service="$(printf '%s' "$challenge" | sed -n 's/.*service="\([^"]*\)".*/\1/p')"
+    scope="$(printf '%s' "$challenge" | sed -n 's/.*scope="\([^"]*\)".*/\1/p')"
+    if [ -n "$realm" ]; then
+      token="$(curl -fsS --max-time 5 "$realm?service=$service&scope=$scope" 2>/dev/null \
+        | sed -n 's/.*"\(access_\)\{0,1\}token": *"\([^"]*\)".*/\2/p' | head -n 1 || true)"
+      [ -n "$token" ] && code="$(curl -sS --max-time 5 -o "$tmp" -w '%{http_code}' \
+        -H "Authorization: Bearer $token" "$url" 2>/dev/null || true)"
+    fi
+  fi
+  [ "$code" = 200 ] && cat "$tmp"
+  rm -f "$tmp" "$tmp.h"
+  [ "$code" = 200 ]
+}
 registry_tags() {
-  curl -fsS --max-time 5 "$(registry_url)/tags/list" 2>/dev/null \
+  registry_get tags/list 2>/dev/null \
     | sed -n 's/.*"tags":\[\([^]]*\)\].*/\1/p' | tr -d '"' | tr ',' '\n' | grep . | sort -V || true
 }
 
+# Tags in the registry. The arch sources (T-amd64, T-arm64) are shown indented
+# under their index so the list reads as one line per version.
 cmd_registry_list() {
   have_curl
-  local tags; tags="$(registry_tags)"
+  local tags t a
+  tags="$(registry_tags)"
   [ -n "$tags" ] || { printf 'no tags in %s (not reachable, or empty)\n' "$REGISTRY"; return 0; }
-  printf '%s\n' "$tags" | sed "s|^|$REGISTRY:|"
+  for t in $tags; do
+    case "$t" in *-amd64|*-arm64) continue ;; esac
+    printf '%s:%s\n' "$REGISTRY" "$t"
+    for a in $ARCHES; do
+      printf '%s\n' "$tags" | grep -qx "$t-$a" && printf '    %s:%s-%s  (arch source)\n' "$REGISTRY" "$t" "$a"
+    done
+  done
+  # Sides without an index: a push that stopped between push and create.
+  for t in $tags; do
+    case "$t" in *-amd64|*-arm64) ;; *) continue ;; esac
+    printf '%s\n' "$tags" | grep -qx "${t%-*}" || printf '%s:%s  (arch source, no index %s yet)\n' "$REGISTRY" "$t" "${t%-*}"
+  done
 }
 
 # Remove one tag from the local registry. Registries delete by manifest, so
 # every tag that points at the same image goes with it (typically <version>
 # and latest); the user is told which before anything happens.
+# The digest a tag points at, or nothing.
+tag_digest() {
+  curl -fsS --max-time 5 -o /dev/null -D - \
+    -H 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json' \
+    "$(registry_url)/manifests/$1" 2>/dev/null | sed -n 's/^[Dd]ocker-[Cc]ontent-[Dd]igest: *//p' | tr -d '\r' || true
+}
+
 cmd_registry_rm() {
   have_curl; have_docker
-  local tag="${1:-}" digest others
+  local tag="${1:-}" all digest digests sources='' others t a d code
   [ -n "$tag" ] || die "registry rm: which tag? (cbde registry list)"
   [ "$REGISTRY" = "$LOCAL_REGISTRY" ] \
     || die "registry rm works on the local registry only; $REGISTRY is managed elsewhere (GHCR: the package's settings page)"
-  digest="$(curl -fsS --max-time 5 -o /dev/null -D - \
-      -H 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json' \
-      "$(registry_url)/manifests/$tag" 2>/dev/null | sed -n 's/^[Dd]ocker-[Cc]ontent-[Dd]igest: *//p' | tr -d '\r' || true)"
+  all="$(registry_tags)"
+  digest="$(tag_digest "$tag")"
   [ -n "$digest" ] || die "no tag $tag in $REGISTRY (cbde registry list)"
-  # Which other tags share the manifest?
-  others="$(for t in $(registry_tags); do
+  digests="$digest"
+  # A version's arch sources (0.2.0-amd64, 0.2.0-arm64) go with it: alone they
+  # are useless, and the next push recreates them anyway.
+  case "$tag" in *-amd64|*-arm64) ;; *)
+    for a in $ARCHES; do
+      printf '%s\n' "$all" | grep -qx "$tag-$a" || continue
+      d="$(tag_digest "$tag-$a")"; [ -n "$d" ] || continue
+      sources="$sources$tag-$a "
+      case " $digests " in *" $d "*) ;; *) digests="$digests $d" ;; esac
+    done ;;
+  esac
+  # Registries delete by manifest, so every other tag on one of these digests
+  # goes too (typically latest and its sources); the user is told which.
+  others="$(for t in $all; do
       [ "$t" = "$tag" ] && continue
-      d="$(curl -fsS --max-time 5 -o /dev/null -D - -H 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json' "$(registry_url)/manifests/$t" 2>/dev/null | sed -n 's/^[Dd]ocker-[Cc]ontent-[Dd]igest: *//p' | tr -d '\r' || true)"
-      [ "$d" = "$digest" ] && printf '%s ' "$t"
+      case " $sources" in *" $t "*) continue ;; esac
+      d="$(tag_digest "$t")"
+      case " $digests " in *" $d "*) printf '%s ' "$t" ;; esac
     done; true)"
+  [ -z "$sources" ] || printf 'cbde: %s has arch sources: %s— removing them too.\n' "$tag" "$sources" >&2
   if [ -n "$others" ] && [ "${2:-}" != --yes ]; then
     printf 'cbde: %s shares its image with: %s — removing it removes those too.\n' "$tag" "$others" >&2
     if [ -t 0 ]; then
-      printf 'continue? [y/N] ' >&2; local a; read -r a
+      printf 'continue? [y/N] ' >&2; read -r a
       case "$a" in y|Y|yes) ;; *) printf 'aborted\n' >&2; return 1 ;; esac
     else
       die "re-run with: cbde registry rm $tag --yes"
     fi
   fi
-  local code; code="$(curl -sS --max-time 10 -o /dev/null -w '%{http_code}' -X DELETE "$(registry_url)/manifests/$digest")"
-  case "$code" in
-    202) printf 'cbde: removed %s:%s%s\n' "$REGISTRY" "$tag" "${others:+ (and $others)}" >&2 ;;
-    405) die "this registry has deletes disabled — recreate it once with: cbde registry down && cbde registry up" ;;
-    *)   die "delete failed (HTTP $code)" ;;
-  esac
+  for d in $digests; do
+    code="$(curl -sS --max-time 10 -o /dev/null -w '%{http_code}' -X DELETE "$(registry_url)/manifests/$d")"
+    case "$code" in
+      202) ;;
+      405) die "this registry has deletes disabled — recreate it once with: cbde registry down && cbde registry up" ;;
+      *)   die "delete failed (HTTP $code)" ;;
+    esac
+  done
+  printf 'cbde: removed %s:%s%s%s\n' "$REGISTRY" "$tag" "${sources:+ (and ${sources% })}" "${others:+ (and $others)}" >&2
   # Unreferenced blobs stay on disk until garbage-collected.
   docker exec "$LOCAL_REGISTRY_NAME" registry garbage-collect --delete-untagged /etc/docker/registry/config.yml >/dev/null 2>&1 \
     && printf 'cbde: garbage-collected the registry volume\n' >&2 || true
@@ -425,7 +578,7 @@ cmd_registry() {
     push)         shift; cmd_registry_push "$@" ;;
     list|ls|tags) cmd_registry_list ;;
     status|"")    cmd_registry_status ;;
-    *) die "unknown registry subcommand: $1 (up | down [--purge] | push [matrix...] | list | remove <tag> | status)" ;;
+    *) die "unknown registry subcommand: $1 (up | down [--purge] | push [matrix...] [--yes] | list | remove <tag> | status)" ;;
   esac
 }
 
@@ -440,7 +593,8 @@ version_sort() {
 }
 image_env() { docker image inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$1" 2>/dev/null || true; }
 env_get()   { printf '%s\n' "$1" | sed -n "s/^$2=//p" | head -n 1; }
-is_version() { case "$1" in [0-9]*.[0-9]*.[0-9]*) return 0 ;; *) return 1 ;; esac; }
+# A matrix tag; the arch sources a push leaves beside it (0.2.0-arm64) are not.
+is_version() { case "$1" in *-amd64|*-arm64) return 1 ;; [0-9]*.[0-9]*.[0-9]*) return 0 ;; *) return 1 ;; esac; }
 local_versions() {
   local t
   for t in $(docker images cbde --format '{{.Tag}}' 2>/dev/null); do is_version "$t" && printf '%s\n' "$t"; done
@@ -540,7 +694,7 @@ cmd_build() {
 # Placeholders. Both are documented in the README as coming, so they explain
 # themselves and print the manual equivalent rather than failing as an unknown
 # verb (which would otherwise be run as a command inside the container).
-INSTALL_URL="https://raw.githubusercontent.com/input-output-hk/cbde/main/install.sh"
+INSTALL_URL="https://raw.githubusercontent.com/input-output-hk/hades/main/install.sh"
 
 cmd_upgrade() {
   note "cbde upgrade is not implemented yet."

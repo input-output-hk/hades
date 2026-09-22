@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# Fake zsh for the installer's --try test: reports what a real zsh would be
+# handed (its ZDOTDIR and rc files, the launcher text in $CBDE_TRY_SCRIPT),
+# then exits like a shell whose user typed `exit`.
+printf 'zsh %s\n' "$*" >> "${STUB_LOG:-/dev/null}"
+printf 'ZDOTDIR=%s\n' "${ZDOTDIR-unset}"
+[ -n "${ZDOTDIR-}" ] && for f in "$ZDOTDIR"/.zshenv "$ZDOTDIR"/.zshrc; do
+  printf -- '--- %s\n' "$(basename "$f")"; cat "$f" 2>/dev/null
+done
+printf 'CBDE_TRY_SCRIPT first line: %s\n' "$(printf '%s\n' "${CBDE_TRY_SCRIPT-unset}" | head -n 1)"
+[ -n "${STUB_ZSH_RUN_CBDE:-}" ] && bash -c "$CBDE_TRY_SCRIPT" cbde $STUB_ZSH_RUN_CBDE
+exit 0

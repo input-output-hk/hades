@@ -23,20 +23,41 @@ Those run in the container against the project in your current directory. No
 
 ## Install
 
-> 🚧 **Placeholder.** The one-liner below is the shape of the installer, not a
-> live URL — the repo is not published yet, so nothing is served at that
-> address. Until it is, use [from a checkout](#install-from-a-checkout).
+> 🚧 **Testing phase.** The installer is on the `feat/curl-install` branch,
+> and the lines below fetch it from there. When it is merged, `feat/curl-install`
+> becomes `main` in both places and `CBDE_REF=` goes away.
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/input-output-hk/cbde/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/input-output-hk/hades/feat/curl-install/install.sh \
+  | CBDE_REF=feat/curl-install sh
 ```
 
-That will drop the `cbde` launcher into `~/.local/bin`, pull the image, and
-create the volume. Then:
+That drops the `cbde` launcher into `~/.local/bin` (or `$CBDE_INSTALL_DIR`,
+or `--dir`) and tells you if that directory is not on your PATH. Nothing else
+happens until you run it:
 
 ```bash
-cbde doctor       # confirm it works
+cbde doctor       # first run pulls the image and fills the volume
 ```
+
+Running the same line again updates the launcher in place.
+
+### Try it without installing
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/input-output-hk/hades/feat/curl-install/install.sh \
+  | CBDE_REF=feat/curl-install sh -s -- --try
+```
+
+This opens your usual shell (bash, zsh or fish) with `cbde` defined as a shell
+function and a `[cbde try]` marker on the prompt. Your own rc files are still
+loaded. Use `cbde` as normal; when you `exit`, the function is gone and
+nothing has been written to disk. The image and the `cbde-data` volume, if
+that session created them, stay in Docker, so installing later starts warm.
+
+Because it is a function rather than a file on PATH, scripts and other
+programs cannot call it. That is fine for trying things out; install for
+anything more.
 
 To remove everything again — launcher, image, and the volume with every cached
 toolchain in it — there is one verb, and it means what it says:
@@ -745,6 +766,7 @@ Everything below is for people changing CBDE itself. Users never need it.
 | `templates/devcontainer.json` | the dev-container template copied into the image; `cbde devcontainer` writes it into user projects |
 | `lib/matrix.sh` | matrix reading and validation, the `active_*` probes, and the seeded installers (`ghcup_install`, `lean_install`, `cabal_index_install`) |
 | `bin/cbde` | the host launcher: `docker run` wrapper, pins, `matrix`, `registry`, `build`, `pull` |
+| `install.sh` | the `curl \| sh` installer: copies `bin/cbde` to `~/.local/bin`, or with `--try` opens a shell where `cbde` is a function |
 | `cbde` | the in-container CLI: version switching, `matrix`, `doctor`, `devcontainer` |
 | `cbde-entrypoint` | adopts the host uid, then provisions |
 | `cbde-provision` | fills the volume from the seed or the network on every start; idempotent |
@@ -806,9 +828,9 @@ runs the standard `registry:2` image for that and remembers to use it:
 
 ```bash
 cbde registry up           # starts localhost:5000, points cbde at it
-cbde registry push         # pushes every local cbde:<version> (and latest) into it
+cbde registry push         # pushes every local cbde:<version> (and latest) into it; asks first
 cbde registry list         # tags it holds
-cbde registry rm 0.1.0     # remove a tag (asks first when other tags share the same image)
+cbde registry rm 0.1.0     # remove a tag and its arch sources (asks first when other tags share the image)
 cbde registry status       # what runs, what cbde uses, which tags it holds
 cbde registry down         # stops it, cbde is back on GHCR (blobs kept; --purge deletes them)
 ```
@@ -823,15 +845,88 @@ behave exactly as against GHCR, just faster. The blobs live in the
 `cbde-registry-data` volume, so `down` and `up` do not lose your pushes, and
 the container restarts with Docker.
 
+On a Mac, port 5000 may already be taken by AirPlay Receiver (Control Center
+answers everything with 403, so `push` seems to work but `list` and the index
+step fail). `cbde registry up` notices and says so; either turn it off in
+System Settings > General > AirDrop & Handoff, or run the registry elsewhere
+with `CBDE_LOCAL_REGISTRY_PORT=5001` exported for every `cbde registry` call.
+
 The override lives in `~/.config/cbde/config` as `registry=localhost:5000/cbde`.
 That file takes `volume=` and `platform=` too, for settings you want in every
 shell without an `export`. The environment (`CBDE_REGISTRY` and friends) still
 wins over the file, and `cbde info` says where each value came from.
 
+### Publishing: one tag, two architectures
+
+A local image is one architecture — amd64 when built on Linux, arm64 on Apple
+Silicon — while the published `cbde:<version>` is both. A plain `docker push`
+of `cbde:0.2.0` would replace whatever architecture is in the registry with
+the pusher's, so `cbde registry push` never pushes the version tag itself. It
+does what CI does with `docker buildx imagetools create`:
+
+1. pushes the local image as `<version>-<arch>`, e.g. `cbde:0.2.0-arm64`;
+2. looks up which of `<version>-amd64` and `<version>-arm64` exist in the
+   registry;
+3. rewrites `<version>` as an index over all of them, then reads it back and
+   prints the platforms it serves.
+
+The arch tags stay in the registry: they are the sources of the index, and
+`cbde registry list` shows them indented under their version while
+`cbde matrix list` ignores them. The two machines can push in either order,
+and pushing the same architecture twice just replaces that side. Before
+touching anything the command prints the plan and asks; pass `--yes` when
+stdin is not a terminal (CI, `| tee`):
+
+```
+cbde: will push
+  cbde:0.2.0 (arm64)  ->  ghcr.io/input-output-hk/cbde:0.2.0-arm64
+  cbde:latest (arm64) ->  ghcr.io/input-output-hk/cbde:latest-arm64
+then rewrite
+  ghcr.io/input-output-hk/cbde:0.2.0   = amd64 (already there) + arm64
+  ghcr.io/input-output-hk/cbde:latest  = amd64 (already there) + arm64
+continue? [y/N]
+```
+
 To publish for real, `docker login ghcr.io` with a token that has
-`write:packages`, then `CBDE_REGISTRY=ghcr.io/input-output-hk/cbde cbde registry push`.
-A new GHCR package is private by default; make it public or `cbde pull` needs a
-login on every machine.
+`write:packages`, then on the Linux box and on the Mac, in either order:
+
+```bash
+CBDE_REGISTRY=ghcr.io/input-output-hk/cbde cbde registry push 0.2.0
+```
+
+The first push makes a single-architecture `0.2.0`; the second turns it into
+the multi-arch one. A new GHCR package is private by default; make it public
+or `cbde pull` needs a login on every machine. `docker buildx` is required
+(Docker Desktop and Colima ship it); it talks plain HTTP to `localhost`, so
+the flow works unchanged against the local registry.
+
+When only one side has been pushed, the plan reads `= amd64`: the index is
+rewritten with that single architecture, so an existing single-arch tag with
+the same content is replaced by an equivalent one. Nothing is lost; the other
+side is added when the other machine pushes. `cbde registry rm <version>` on
+the local registry removes the index together with its arch sources.
+
+### Testing the installer
+
+`install.sh` fetches one file, `bin/cbde`, from GitHub. Which one is chosen
+by `--repo` / `$CBDE_REPO` (default `input-output-hk/hades`) and `--ref` /
+`$CBDE_REF` (default `main`), so a branch can be tried before it is merged:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/input-output-hk/hades/feat/x/install.sh \
+  | CBDE_REF=feat/x sh -s -- --try
+```
+
+Both the installer's URL and `CBDE_REF` name the branch: the first fetches
+the installer, the second tells it where to fetch the launcher. For changes
+that are not pushed yet, skip the network entirely:
+
+```bash
+CBDE_SOURCE=file://$PWD/bin/cbde sh install.sh --try
+CBDE_SOURCE=file://$PWD/bin/cbde sh install.sh --dir /tmp/bin
+```
+
+`CBDE_SOURCE` is the full URL of the launcher and overrides repo and ref.
 
 ### Tests
 
@@ -911,7 +1006,7 @@ Launcher-side (host):
 | `cbde matrix [list\|reset]`                   | which compatibility matrix runs here, verified or custom     |
 | `cbde matrix <name>` / `unpin`                | pin this project to matrix `<name>` (pulls `cbde:<name>`), or stop |
 | `cbde devcontainer`                           | write `.devcontainer/devcontainer.json` here                 |
-| `cbde registry up\|down\|push\|list\|rm\|status` | local `registry:2` for development, and the registry override |
+| `cbde registry up\|down\|push\|list\|rm\|status` | local `registry:2` for development, and the registry override; `push` publishes `<tag>-<arch>` and merges the multi-arch `<tag>` |
 | `cbde pull [tag]`                             | pull `$CBDE_REGISTRY:<tag>`; tagged `cbde:<tag>` and `cbde:<version>` |
 | `cbde build [--matrix <name>] [docker args]`  | build a matrix (default: newest, or the project's pin) for the host's architecture |
 | `cbde volume [info\|rm]`                      | inspect or delete the volume                                 |

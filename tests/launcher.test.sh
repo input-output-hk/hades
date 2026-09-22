@@ -272,6 +272,17 @@ test_registry_up_starts_registry_and_writes_config() {
   assert_contains "$out" "registry   localhost:5000/cbde  (from: $CFG)"
 }
 
+test_registry_up_warns_when_the_port_answers_but_is_not_the_registry() {
+  with_cfg; mkrepo p && cd p
+  STUB_PORT_TAKEN=1 run "$CBDE" registry up
+  assert_rc "$rc" 0 "$out"
+  assert_contains "$out" "something else answers on localhost:5000 (not the registry) — Server: AirTunes/870.14.1"
+  assert_contains "$out" "CBDE_LOCAL_REGISTRY_PORT=5001 cbde registry up"
+  run "$CBDE" registry up
+  assert_not_contains "$out" "something else answers"
+  assert_contains "$(cat "$STUB_LOG")" "http://localhost:5000/v2/"
+}
+
 test_registry_up_restarts_a_stopped_one_and_is_idempotent() {
   with_cfg; mkrepo p && cd p
   STUB_CONTAINERS="cbde-registry:stopped" run "$CBDE" registry up
@@ -330,21 +341,99 @@ test_registry_down_leaves_a_foreign_registry_setting_alone() {
   assert_eq "$(sed -n 's/^registry=//p' "$CFG")" "ghcr.io/myfork/cbde"
 }
 
-test_registry_push_tags_and_pushes_local_images() {
-  with_cfg; mkrepo p && cd p
-  mkdir -p "$T/xdg/cbde"; printf 'registry=localhost:5000/cbde\n' > "$CFG"
-  STUB_IMAGES="cbde:0.2.0 cbde:0.1.0 cbde:latest" STUB_TAGS="0.1.0 0.2.0 latest base" run "$CBDE" registry push
+# `registry push` publishes one architecture per machine as <tag>-<arch> and
+# rewrites <tag> as an index over every arch tag in the registry, so Linux
+# (amd64) and a Mac (arm64) can push in either order.
+push_cfg() { with_cfg; mkrepo p && cd p; mkdir -p "$T/xdg/cbde"; printf 'registry=localhost:5000/cbde\n' > "$CFG"; }
+R=localhost:5000/cbde
+
+test_registry_push_first_from_linux_makes_a_single_arch_index() {
+  push_cfg
+  STUB_IMAGES="cbde:0.2.0 cbde:0.1.0 cbde:latest" STUB_TAGS="0.1.0 0.2.0 latest base" STUB_REMOTE_ARCH_TAGS= \
+    run "$CBDE" registry push --yes
   assert_rc "$rc" 0 "$out"
   local log; log="$(cat "$STUB_LOG")"
-  assert_contains "$log" "docker tag cbde:0.1.0 localhost:5000/cbde:0.1.0"
-  assert_contains "$log" "docker push localhost:5000/cbde:0.2.0"
-  assert_contains "$log" "docker push localhost:5000/cbde:latest"
+  assert_contains "$log" "docker tag cbde:0.2.0 $R:0.2.0-amd64"
+  assert_contains "$log" "docker push $R:0.2.0-amd64"
+  assert_contains "$log" "docker push $R:latest-amd64"
+  assert_contains "$log" "docker push $R:0.1.0-amd64"
+  assert_not_contains "$log" "docker push $R:0.2.0
+" "the version tag itself is never pushed, only rewritten"
   assert_not_contains "$log" "cbde:base" "only version tags and latest"
-  : > "$STUB_LOG"
-  STUB_IMAGES="cbde:0.2.0" run "$CBDE" registry push 0.2.0
+  assert_contains "$log" "docker buildx imagetools create -t $R:0.2.0 $R:0.2.0-amd64
+"
+  assert_contains "$log" "docker buildx imagetools create -t $R:latest $R:latest-amd64
+"
+  assert_not_contains "$log" "$R:0.2.0-amd64 $R:0.2.0-arm64" "no arm64 side exists yet, so the index has one source"
+  assert_contains "$log" "docker buildx imagetools inspect $R:0.2.0
+" "the index is read back"
+  assert_contains "$out" "$R:0.2.0 now serves: linux/amd64"
+}
+
+test_registry_push_second_from_a_mac_merges_both_arches() {
+  push_cfg
+  STUB_ARCH=arm64 STUB_IMAGES="cbde:0.2.0 cbde:latest" STUB_TAGS="0.2.0 latest" \
+    STUB_REMOTE_ARCH_TAGS="0.2.0-amd64 latest-amd64" run "$CBDE" registry push --yes
+  assert_rc "$rc" 0 "$out"
+  local log; log="$(cat "$STUB_LOG")"
+  assert_contains "$log" "docker push $R:0.2.0-arm64"
+  assert_not_contains "$log" "docker push $R:0.2.0-amd64" "the other side is not ours to push"
+  assert_contains "$log" "docker buildx imagetools create -t $R:0.2.0 $R:0.2.0-amd64 $R:0.2.0-arm64
+"
+  assert_contains "$log" "docker buildx imagetools create -t $R:latest $R:latest-amd64 $R:latest-arm64
+"
+  assert_contains "$out" "$R:0.2.0 now serves: linux/amd64 linux/arm64"
+}
+
+test_registry_push_same_arch_again_is_idempotent() {
+  push_cfg
+  STUB_ARCH=arm64 STUB_IMAGES="cbde:0.2.0" STUB_TAGS="0.2.0" \
+    STUB_REMOTE_ARCH_TAGS="0.2.0-amd64 0.2.0-arm64" run "$CBDE" registry push 0.2.0 --yes
+  assert_rc "$rc" 0 "$out"
+  local log; log="$(cat "$STUB_LOG")"
   assert_eq "$(grep -c 'docker push' "$STUB_LOG")" 1
-  STUB_IMAGES= run "$CBDE" registry push 9.9.9
+  assert_contains "$log" "docker buildx imagetools create -t $R:0.2.0 $R:0.2.0-amd64 $R:0.2.0-arm64
+" "each source once, in a fixed order"
+  assert_eq "$(grep -c 'imagetools create' "$STUB_LOG")" 1
+  assert_contains "$out" "arm64 (replaced)"
+}
+
+test_registry_push_without_tty_needs_yes_and_pushes_nothing() {
+  push_cfg
+  STUB_IMAGES="cbde:0.2.0 cbde:latest" STUB_TAGS="0.2.0 latest" run "$CBDE" registry push
+  assert_rc "$rc" 1
+  assert_contains "$out" "re-run with: cbde registry push --yes"
+  assert_not_contains "$(cat "$STUB_LOG")" "docker push"
+  assert_not_contains "$(cat "$STUB_LOG")" "imagetools create"
+  STUB_IMAGES="cbde:0.2.0" run "$CBDE" registry push 0.2.0
+  assert_rc "$rc" 1; assert_contains "$out" "re-run with: cbde registry push 0.2.0 --yes"
+}
+
+test_registry_push_prints_the_plan_with_tags_and_arches() {
+  push_cfg
+  STUB_ARCH=arm64 STUB_IMAGES="cbde:0.2.0 cbde:latest" STUB_TAGS="0.2.0 latest" \
+    STUB_REMOTE_ARCH_TAGS="0.2.0-amd64 latest-amd64" run "$CBDE" registry push
+  assert_contains "$out" "cbde: will push"
+  assert_match "$out" "cbde:0.2.0 \(arm64\) +->  $R:0.2.0-arm64"
+  assert_match "$out" "cbde:latest \(arm64\) +->  $R:latest-arm64"
+  assert_contains "$out" "then rewrite"
+  assert_match "$out" "$R:0.2.0 += amd64 \(already there\) \+ arm64"
+  assert_match "$out" "$R:latest += amd64 \(already there\) \+ arm64"
+  : > "$STUB_LOG"
+  STUB_IMAGES="cbde:0.2.0" STUB_TAGS="0.2.0" run "$CBDE" registry push
+  assert_match "$out" "$R:0.2.0 += amd64$" "nothing remote yet: the index will be this side alone"
+}
+
+test_registry_push_refuses_missing_images_and_skips_local_arch_tags() {
+  push_cfg
+  STUB_IMAGES= run "$CBDE" registry push 9.9.9 --yes
   assert_rc "$rc" 1; assert_contains "$out" "no local image cbde:9.9.9"
+  assert_not_contains "$(cat "$STUB_LOG")" "docker push"
+  # A `cbde pull 0.2.0-arm64` leaves cbde:0.2.0-arm64 locally; it is a side, not a matrix.
+  STUB_IMAGES="cbde:0.2.0 cbde:0.2.0-arm64" STUB_TAGS="0.2.0 0.2.0-arm64" run "$CBDE" registry push --yes
+  assert_rc "$rc" 0 "$out"
+  assert_eq "$(grep -c 'docker push' "$STUB_LOG")" 1
+  assert_not_contains "$(cat "$STUB_LOG")" "0.2.0-arm64-"
 }
 
 test_registry_status_and_unknown_subcommand() {
@@ -357,6 +446,26 @@ test_registry_status_and_unknown_subcommand() {
   assert_rc "$rc" 1; assert_contains "$out" "unknown registry subcommand"
 }
 
+test_registry_list_does_the_token_handshake_anonymously() {
+  # GHCR: 401 + Www-Authenticate, then an anonymous token, then the tags.
+  with_cfg; mkrepo p && cd p
+  STUB_REGISTRY_AUTH=1 STUB_TAGS_JSON='{"tags":["0.2.0","latest"]}' run "$CBDE" registry list
+  assert_rc "$rc" 0
+  assert_contains "$out" "ghcr.io/input-output-hk/cbde:0.2.0"
+  assert_contains "$out" "ghcr.io/input-output-hk/cbde:latest"
+  log="$(cat "$STUB_LOG")"
+  assert_contains "$log" "https://ghcr.io/token?service=ghcr.io&scope=repository:x/cbde:pull"
+  assert_contains "$log" "Authorization: Bearer t0k"
+  assert_not_contains "$log" "-u "                      # no credentials, ever
+}
+
+test_registry_list_without_challenge_makes_one_request() {
+  with_cfg; mkrepo p && cd p
+  STUB_TAGS_JSON='{"tags":["0.2.0"]}' run "$CBDE" registry list
+  assert_rc "$rc" 0
+  assert_eq "$(grep -c '^curl' "$STUB_LOG")" 1
+}
+
 test_registry_list_prints_tags_version_sorted() {
   with_cfg; mkrepo p && cd p
   mkdir -p "$T/xdg/cbde"; printf 'registry=localhost:5000/cbde\n' > "$CFG"
@@ -366,6 +475,19 @@ test_registry_list_prints_tags_version_sorted() {
   assert_contains "$(cat "$STUB_LOG")" "http://localhost:5000/v2/cbde/tags/list"
   STUB_TAGS_JSON='{"tags":[]}' run "$CBDE" registry list
   assert_contains "$out" "no tags in localhost:5000/cbde"
+}
+
+test_registry_list_nests_arch_sources_under_their_index() {
+  with_cfg; mkrepo p && cd p
+  mkdir -p "$T/xdg/cbde"; printf 'registry=localhost:5000/cbde\n' > "$CFG"
+  STUB_TAGS_JSON='{"tags":["0.2.0-arm64","latest","0.2.0","0.2.0-amd64","latest-amd64","0.3.0-arm64"]}' run "$CBDE" registry list
+  assert_rc "$rc" 0 "$out"
+  assert_eq "$out" "localhost:5000/cbde:0.2.0
+    localhost:5000/cbde:0.2.0-amd64  (arch source)
+    localhost:5000/cbde:0.2.0-arm64  (arch source)
+localhost:5000/cbde:latest
+    localhost:5000/cbde:latest-amd64  (arch source)
+localhost:5000/cbde:0.3.0-arm64  (arch source, no index 0.3.0 yet)"
 }
 
 test_registry_rm_deletes_by_digest_and_garbage_collects() {
@@ -408,6 +530,46 @@ test_registry_rm_errors_are_explained() {
   assert_not_contains "$(cat "$STUB_LOG")" "DELETE"
 }
 
+test_registry_rm_takes_the_arch_sources_with_the_index() {
+  with_cfg; mkrepo p && cd p
+  mkdir -p "$T/xdg/cbde"; printf 'registry=localhost:5000/cbde\n' > "$CFG"
+  # 0.1.0 is an index over its two sources; nothing else shares them: no prompt.
+  STUB_TAGS_JSON='{"tags":["0.1.0","0.1.0-amd64","0.1.0-arm64","0.2.0"]}' \
+    STUB_DIGESTS="0.1.0=sha256:i1 0.1.0-amd64=sha256:a1 0.1.0-arm64=sha256:b1 0.2.0=sha256:i2" \
+    run "$CBDE" registry rm 0.1.0
+  assert_rc "$rc" 0 "$out"
+  assert_contains "$out" "0.1.0 has arch sources: 0.1.0-amd64 0.1.0-arm64"
+  assert_not_contains "$out" "shares its image"
+  assert_contains "$out" "removed localhost:5000/cbde:0.1.0 (and 0.1.0-amd64 0.1.0-arm64)"
+  log="$(cat "$STUB_LOG")"
+  assert_contains "$log" "-X DELETE http://localhost:5000/v2/cbde/manifests/sha256:i1"
+  assert_contains "$log" "-X DELETE http://localhost:5000/v2/cbde/manifests/sha256:a1"
+  assert_contains "$log" "-X DELETE http://localhost:5000/v2/cbde/manifests/sha256:b1"
+  assert_not_contains "$log" "manifests/sha256:i2"
+}
+
+test_registry_rm_reports_latest_and_its_sources_as_shared() {
+  with_cfg; mkrepo p && cd p
+  mkdir -p "$T/xdg/cbde"; printf 'registry=localhost:5000/cbde\n' > "$CFG"
+  # latest was built from the same sources: same index digest, same source digests.
+  export STUB_TAGS_JSON='{"tags":["0.2.0","0.2.0-amd64","0.2.0-arm64","latest","latest-amd64","latest-arm64"]}'
+  export STUB_DIGESTS="0.2.0=sha256:i 0.2.0-amd64=sha256:a 0.2.0-arm64=sha256:b latest=sha256:i latest-amd64=sha256:a latest-arm64=sha256:b"
+  run "$CBDE" registry rm 0.2.0
+  assert_rc "$rc" 1
+  assert_contains "$out" "0.2.0 shares its image with: latest latest-amd64 latest-arm64"
+  assert_not_contains "$(cat "$STUB_LOG")" "DELETE"
+  : > "$STUB_LOG"
+  run "$CBDE" registry rm 0.2.0 --yes
+  assert_rc "$rc" 0 "$out"
+  assert_eq "$(grep -c -- '-X DELETE' "$STUB_LOG")" 3
+  # removing just one side leaves the index and the other side alone
+  : > "$STUB_LOG"
+  run "$CBDE" registry rm 0.2.0-arm64 --yes
+  assert_rc "$rc" 0 "$out"
+  assert_eq "$(grep -c -- '-X DELETE' "$STUB_LOG")" 1
+  assert_contains "$(cat "$STUB_LOG")" "manifests/sha256:b"
+}
+
 test_registry_rm_never_stops_the_registry() {
   with_cfg; mkrepo p && cd p
   mkdir -p "$T/xdg/cbde"; printf 'registry=localhost:5000/cbde\n' > "$CFG"
@@ -424,8 +586,10 @@ test_matrix_list_merges_local_images_and_registry_tags() {
   with_cfg; mkrepo p && cd p
   mkdir -p "$T/xdg/cbde"; printf 'registry=localhost:5000/cbde\n' > "$CFG"
   STUB_TAGS="0.1.0 0.2.0 latest base" STUB_IMAGES="cbde:latest cbde:0.1.0 cbde:0.2.0" STUB_GHC_0_1_0=9.6.6 \
-    STUB_TAGS_JSON='{"tags":["0.2.0","0.3.0","latest"]}' run "$CBDE" matrix list
+    STUB_TAGS_JSON='{"tags":["0.2.0","0.2.0-amd64","0.2.0-arm64","0.3.0","0.3.0-amd64","latest","latest-arm64"]}' run "$CBDE" matrix list
   assert_rc "$rc" 0 "$out"
+  assert_not_contains "$out" "amd64" "arch sources are not matrices"
+  assert_not_contains "$out" "arm64"
   assert_match "$out" '^    0\.1\.0 +GHC 9\.6\.6 +cabal 3\.10\.3\.0 +Lean v4\.24\.0 +local$'
   assert_match "$out" '^  \* 0\.2\.0 +GHC 9\.6\.7 .* local, registry, latest   <- this project$'
   assert_match "$out" '^    0\.3\.0 +\(in registry, not pulled\) +cbde matrix 0\.3\.0  to use it$'
