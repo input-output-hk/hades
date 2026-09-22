@@ -237,7 +237,8 @@ matrix_list_table() {
       "$(matrix_get "$f" CBDE_LEAN | sed 's|^leanprover/lean4:||')" \
       "$([ "$name" = "$own" ] && printf '  <- this image')"
   done
-  printf '\n  Each matrix ships as its own image, cbde:<name>. Newer ones than %s: cbde pull.\n' "${own:-?}"
+  printf '\n  These are the matrices known when this image was built. For what actually\n'
+  printf '  exists, locally and in the registry, run on the host:  cbde matrix list\n'
 }
 
 # The full picture for one matrix: baked pins, then the switchable components

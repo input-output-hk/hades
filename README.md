@@ -19,7 +19,7 @@ Those run in the container against the project in your current directory. No
 - **[What's in the box](#whats-in-the-box)** — every pinned version
 - **[The tools, one by one](#the-tools-one-by-one)** — Haskell/Plinth · plustan · Aiken · Blaster · Nix · PBT
 - **[Switching versions](#switching-toolchain-versions)** · **[Compatibility matrices](#compatibility-matrices)** · **[VS Code](#vs-code-dev-containers)** · **[Your own user](#running-as-your-own-user)**
-- **[macOS (Apple Silicon)](#macos-apple-silicon)** · **[Updating and removing](#updating-and-removing)** · **[Gotchas](#gotchas)** · **[Reference](#reference)**
+- **[macOS (Apple Silicon)](#macos-apple-silicon)** · **[Updating and removing](#updating-and-removing)** · **[Gotchas](#gotchas)** · **[Developing CBDE](#developing-cbde)** · **[Reference](#reference)**
 
 ## Install
 
@@ -499,9 +499,23 @@ in your volume yet, it is unpacked from the image rather than downloaded:
 
 ```bash
 cbde matrix 0.1.0        # pulls cbde:0.1.0 if needed, writes .cbde, updates devcontainer.json
-cbde matrix list         # every matrix this image knows about
+cbde matrix list         # every matrix that exists: local images and the registry's tags
 cbde matrix unpin        # back to cbde:latest
 ```
+
+```console
+$ cbde matrix list
+    0.1.0    GHC 9.6.6    cabal 3.10.3.0   Lean v4.24.0   local
+  * 0.2.0    GHC 9.6.7    cabal 3.10.3.0   Lean v4.24.0   local, registry, latest   <- this project
+    0.3.0    (in registry, not pulled)                     cbde matrix 0.3.0  to use it
+
+  registry: ghcr.io/input-output-hk/cbde
+```
+
+The list is built from what is really there — your local `cbde:<version>`
+images, whose pins are read from the image itself, and the registry's tag
+list — never from a catalog baked into an image, which would be stale the day
+the next matrix ships. Offline you still see everything local.
 
 The pin is one line, `matrix=0.1.0`, in a `.cbde` file at the project root.
 Commit it. From then on every `cbde …` command in that project runs
@@ -718,7 +732,106 @@ the new image's pins are provisioned on the next start.
 7. **`cabal list-bin` re-runs the solver** — pass matching `--flags=-fixtures`
    when querying plustan paths.
 
-## Reference
+## Developing CBDE
+
+Everything below is for people changing CBDE itself. Users never need it.
+
+### What is where
+
+| Path | What it is |
+| ---- | ---------- |
+| `Dockerfile` | the image, in stages: crypto libs, `base`, `toolchain` (also builds the seed), plustan, aiken, Blaster, `final` |
+| `matrices/<version>.env` | one compatibility matrix per file: the single source of every pin |
+| `templates/devcontainer.json` | the dev-container template copied into the image; `cbde devcontainer` writes it into user projects |
+| `lib/matrix.sh` | matrix reading and validation, the `active_*` probes, and the seeded installers (`ghcup_install`, `lean_install`, `cabal_index_install`) |
+| `bin/cbde` | the host launcher: `docker run` wrapper, pins, `matrix`, `registry`, `build`, `pull` |
+| `cbde` | the in-container CLI: version switching, `matrix`, `doctor`, `devcontainer` |
+| `cbde-entrypoint` | adopts the host uid, then provisions |
+| `cbde-provision` | fills the volume from the seed or the network on every start; idempotent |
+| `tests/` | the unit tests, their stubs and fixtures |
+| `.github/workflows/docker.yml` | tests on Linux and macOS, then a native multi-arch build per matrix |
+
+Two rules hold it together. **The matrix file is the truth**: the Dockerfile's
+`ARG` defaults mirror the newest one and the build fails if they drift, and
+everything the image knows about itself comes from that file. **The volume is
+a cache**: nothing in it is precious, and every start may rebuild any part of
+it from the image.
+
+### Releasing a new matrix
+
+A matrix is a set of pins that was verified to work together. Publishing one:
+
+1. Copy the newest file, `cp matrices/0.2.0.env matrices/0.3.0.env`, set
+   `CBDE_IMAGE_VERSION=0.3.0` and change the pins you are moving. Keep the
+   others. Values are letters, digits and `._:/+~@-`, nothing else.
+2. Mirror the changed lines in the `ARG` block at the top of the `Dockerfile`.
+   Only the newest matrix is mirrored there.
+3. `tests/run repo` confirms the file validates and the mirror is exact.
+4. `bin/cbde build` builds it as `cbde:0.3.0` and `cbde:latest`. Older
+   matrices stay buildable forever: `bin/cbde build --matrix 0.2.0`.
+5. Push the branch. CI runs the tests, builds both architectures from the
+   file, and tags the multi-arch manifest `0.3.0`; `latest` moves only when the
+   newest matrix was built. A `workflow_dispatch` with a matrix name rebuilds
+   an older one without touching `latest`.
+
+Moving the index-states (`CBDE_INDEX_STATE`, `CBDE_CHAP_INDEX_STATE`) is also a
+new matrix: they say which Hackage and CHaP snapshot the set was verified
+against, and the image ships that snapshot.
+
+### Building
+
+```bash
+bin/cbde build                              # newest matrix -> cbde:<version> and cbde:latest
+bin/cbde build --matrix 0.1.0               # an older one -> cbde:0.1.0 only
+bin/cbde build --no-cache                   # extra args go to docker build
+docker build --target base -t cbde:base .   # system layer only, Dockerfile defaults
+```
+
+`cbde build` passes every line of the matrix as a `--build-arg`. A full build
+is 30 to 45 minutes: Z3 and the crypto libraries compile from source, plustan
+compiles against the matrix's GHC, and the `toolchain` stage prefetches the
+seed and installs from it in strict mode, so a broken seed fails the build
+rather than the first user. Everything is cached per stage; a change to the
+scripts alone rebuilds in a couple of minutes.
+
+The Dockerfile is multi-arch and each side builds natively. Cross-building with
+`CBDE_PLATFORM` set works but runs the compilers under emulation for hours; let
+CI produce the other architecture.
+
+### The local registry
+
+Nothing is on GHCR yet, and even when it is you will want to try a matrix end
+to end — pull, pin, switch — without touching the real registry. The launcher
+runs the standard `registry:2` image for that and remembers to use it:
+
+```bash
+cbde registry up           # starts localhost:5000, points cbde at it
+cbde registry push         # pushes every local cbde:<version> (and latest) into it
+cbde registry list         # tags it holds
+cbde registry rm 0.1.0     # remove a tag (asks first when other tags share the same image)
+cbde registry status       # what runs, what cbde uses, which tags it holds
+cbde registry down         # stops it, cbde is back on GHCR (blobs kept; --purge deletes them)
+```
+
+A registry deletes by image, not by tag name, so removing `0.2.0` while
+`latest` points at the same image removes both; `rm` tells you and asks.
+Removal works on the local registry only — GHCR tags are deleted from the
+package's settings page.
+
+From then on `cbde pull`, `cbde matrix <name>` and the CI-shaped tag layout
+behave exactly as against GHCR, just faster. The blobs live in the
+`cbde-registry-data` volume, so `down` and `up` do not lose your pushes, and
+the container restarts with Docker.
+
+The override lives in `~/.config/cbde/config` as `registry=localhost:5000/cbde`.
+That file takes `volume=` and `platform=` too, for settings you want in every
+shell without an `export`. The environment (`CBDE_REGISTRY` and friends) still
+wins over the file, and `cbde info` says where each value came from.
+
+To publish for real, `docker login ghcr.io` with a token that has
+`write:packages`, then `CBDE_REGISTRY=ghcr.io/input-output-hk/cbde cbde registry push`.
+A new GHCR package is private by default; make it public or `cbde pull` needs a
+login on every machine.
 
 ### Tests
 
@@ -727,14 +840,41 @@ tests/run              # everything, in seconds
 tests/run launcher     # one file: tests/launcher.test.sh
 ```
 
-Plain bash, no framework, nothing to install. `docker`, `ghcup`, `elan` and the
-toolchain binaries are stubs on `PATH` (`tests/stubs`), so the suite asserts on
-the exact `docker run` line the launcher would execute, on what `cbde matrix`
-prints for a given fake volume, and on the repository's own consistency: every
-matrix validates, the Dockerfile defaults equal the newest matrix, every matrix
-key is a Dockerfile `ARG`. CI runs it on Linux and on macOS (stock bash 3.2)
-before any image is built. Real builds and real provisioning are the slow tier
-and stay in CI.
+Plain bash, no framework, nothing to install. `docker`, `ghcup`, `elan`, `ghc`,
+`cabal` and the HLS wrapper are stubs on `PATH` (`tests/stubs`) that log their
+arguments, so a test asserts on the exact `docker run` line the launcher would
+execute, on what `cbde matrix` prints for a given fake volume, on what the
+seeded installers do with a fake seed, and on the repository's own consistency:
+every matrix validates, the Dockerfile mirrors the newest one, every matrix key
+is a Dockerfile `ARG`. CI runs it on Linux and on macOS, the latter because the
+launcher must run on stock bash 3.2 and that is the only place to prove it.
+
+The stubs cannot catch a wrong assumption about a real tool — the Lean probe
+once read the wrong `elan` command and only a real run showed it — so after
+touching the provisioner or the seeds, run the slow tier by hand:
+
+```bash
+docker run --rm --network none -v cbde-scratch:/nix cbde:latest \
+  bash -c 'ghc --version; cabal --version; lean --version; lake --version; cbde matrix'
+docker volume rm cbde-scratch
+```
+
+Every line must say "from the image (no download)" and the verdict must be
+"verified".
+
+### Conventions
+
+- `bin/cbde` and `lib/matrix.sh` run on macOS's bash 3.2: no associative
+  arrays, no `${var,,}`, no `mapfile`; empty arrays expand as `${a[@]+"${a[@]}"}`.
+  A repo test greps for the usual offenders.
+- The in-container scripts may assume bash 5 and GNU tools.
+- Matrix files are data, never sourced: read them with `matrix_get`.
+- Anything that writes into the volume unpacks beside its target and renames,
+  so an interrupted start never leaves a half-installed toolchain that a probe
+  would report as present.
+- Private working notes go in files named `*.ignore.*`; git ignores them.
+
+## Reference
 
 ### Environment variables
 
@@ -755,7 +895,7 @@ Launcher-side (host):
 | `CBDE_IMAGE`       | `cbde:latest`, or `cbde:<pin>` | which image to run; overrides a project's `.cbde` pin |
 | `CBDE_VOLUME`      | `cbde-data`   | which volume to mount at `/nix`                                 |
 | `CBDE_PLATFORM`    | _(native)_    | force a platform on `docker run`/`pull`/`build`, e.g. `linux/amd64` on Apple Silicon (emulated) |
-| `CBDE_REGISTRY`    | `ghcr.io/input-output-hk/cbde` | where `cbde pull` fetches from                 |
+| `CBDE_REGISTRY`    | `ghcr.io/input-output-hk/cbde`, or `registry=` in `~/.config/cbde/config` | where `cbde pull` fetches from |
 | `CBDE_DOCKER_ARGS` | —             | extra `docker run` flags, e.g. `'-p 8080:8080 -v ~/data:/data'` |
 
 ### Launcher commands
@@ -771,44 +911,9 @@ Launcher-side (host):
 | `cbde matrix [list\|reset]`                   | which compatibility matrix runs here, verified or custom     |
 | `cbde matrix <name>` / `unpin`                | pin this project to matrix `<name>` (pulls `cbde:<name>`), or stop |
 | `cbde devcontainer`                           | write `.devcontainer/devcontainer.json` here                 |
+| `cbde registry up\|down\|push\|list\|rm\|status` | local `registry:2` for development, and the registry override |
 | `cbde pull [tag]`                             | pull `$CBDE_REGISTRY:<tag>`; tagged `cbde:<tag>` and `cbde:<version>` |
 | `cbde build [--matrix <name>] [docker args]`  | build a matrix (default: newest, or the project's pin) for the host's architecture |
 | `cbde volume [info\|rm]`                      | inspect or delete the volume                                 |
 | `cbde info`                                   | show resolved image, registry, volume, platform and paths    |
 | `cbde upgrade` / `self-destruct`              | 🚧 placeholders, see [above](#updating-and-removing)         |
-
-### Building the image yourself
-
-```bash
-cbde build                                  # newest matrix -> cbde:<version> and cbde:latest
-cbde build --matrix 0.2.0                   # a specific one
-docker build --target base -t cbde:base .   # system layer only, Dockerfile defaults
-```
-
-`cbde build` reads `matrices/<name>.env` and passes every pin as a
-`--build-arg`. A plain `docker build .` uses the Dockerfile's defaults, which
-mirror the newest matrix; the build fails if they have drifted apart.
-
-The Dockerfile is multi-arch: it builds natively for `amd64` and `arm64`
-(`TARGETARCH` selects the ghcup and aiken downloads; everything else compiles
-from source). Cross-building with `--platform` works but runs the compilers
-under emulation for hours — build native and let CI produce the other half.
-CI (`.github/workflows/docker.yml`) builds both on native runners and pushes a
-multi-arch manifest to `ghcr.io/input-output-hk/cbde:<version>` and `:latest` on
-every push to `main` — the GHCR package has to be public for `cbde pull` to
-work without `docker login ghcr.io`.
-
-| Image         | To pull | Unpacked |
-| ------------- | ------- | -------- |
-| `cbde:latest` | 505 MB  | 1.79 GB  |
-| `cbde:base`   | 361 MB  | 1.31 GB  |
-
-`cbde:base` is a build convenience (`--target base`), not something users pull:
-the final image is built `FROM base`, so base's layers are already the first
-layers of `cbde:latest`. Pulling `cbde:latest` gets everything in one download.
-
-Pins are build arguments — `--build-arg CBDE_GHC=9.6.6`,
-`--build-arg AIKEN_VERSION=v1.1.24`, and so on; see the `ARG`s at the top of the
-`Dockerfile`.
-
----

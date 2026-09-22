@@ -4,14 +4,33 @@
 #   STUB_IMAGES         space-separated refs that `image inspect` reports present
 #   STUB_IMAGE_VERSION  CBDE_IMAGE_VERSION that `image inspect -f` reports
 #   STUB_PULL_FAIL      set to make `docker pull` fail
+#   STUB_CONTAINERS     names `container inspect` reports (append :stopped for a stopped one)
+#   STUB_TAGS           what `docker images cbde --format` lists
 printf 'docker %s\n' "$*" >> "${STUB_LOG:?STUB_LOG is not set}"
 case "${1:-} ${2:-}" in
   "image inspect")
-    case " $* " in
-      *" -f "*|*" --format "*) printf 'PATH=/usr/bin\nCBDE_IMAGE_VERSION=%s\n' "${STUB_IMAGE_VERSION:-0.2.0}"; exit 0 ;;
-    esac
     for ref; do :; done
+    case " $* " in
+      *" -f "*|*" --format "*)
+        # Env of an image: version from STUB_IMAGE_VERSION, else from the ref's
+        # tag (latest -> 0.2.0). Pins default to matrix 0.2.0's; a tag's GHC
+        # can be overridden with STUB_GHC_<tag with dots as underscores>.
+        tag="${ref##*:}"; [ "$tag" = latest ] && tag=0.2.0
+        v="${STUB_IMAGE_VERSION:-$tag}"
+        eval "ghc=\${STUB_GHC_$(printf '%s' "$tag" | tr . _)-9.6.7}"
+        printf 'PATH=/usr/bin\nCBDE_IMAGE_VERSION=%s\nCBDE_GHC=%s\nCBDE_CABAL=3.10.3.0\nCBDE_LEAN=leanprover/lean4:v4.24.0\n' "$v" "$ghc"
+        exit 0 ;;
+    esac
     case " ${STUB_IMAGES:-} " in *" $ref "*) exit 0 ;; *) exit 1 ;; esac ;;
+  "container inspect")
+    for ref; do :; done
+    case " ${STUB_CONTAINERS:-} " in
+      *" $ref "*)   case " $* " in *" -f "*) echo true ;; esac; exit 0 ;;
+      *" $ref:stopped "*) case " $* " in *" -f "*) echo false ;; esac; exit 0 ;;
+      *) exit 1 ;;
+    esac ;;
+  "images "*) printf '%s\n' ${STUB_TAGS-0.2.0 latest} ;;
+  "exec "*) exit 0 ;;
   "pull "*) [ -z "${STUB_PULL_FAIL:-}" ] || { echo "stub: pull failed" >&2; exit 1; } ;;
   "volume inspect") exit 1 ;;
 esac
