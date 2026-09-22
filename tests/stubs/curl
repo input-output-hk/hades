@@ -4,6 +4,8 @@
 #   STUB_TAGS_JSON   tags/list body, default {"tags":["0.2.0","latest"]}
 #   STUB_DIGESTS     "tag=digest ..." for manifests/<tag>; default: all share sha256:aaa
 #   STUB_DELETE_CODE HTTP code for DELETE, default 202
+# The installer's fetch of bin/cbde is served from a file:
+#   STUB_CURL_FILE   body for any .../bin/cbde URL; STUB_CURL_FAIL=1 -> exit 22
 printf 'curl %s\n' "$*" >> "${STUB_LOG:-/dev/null}"
 url=; method=GET; want_code=; dump_headers=
 while [ $# -gt 0 ]; do
@@ -12,11 +14,14 @@ while [ $# -gt 0 ]; do
     -w) want_code=1; shift ;;
     -D) dump_headers=1; shift ;;
     -o|-H|--max-time) shift ;;
-    http://*|https://*) url="$1" ;;
+    http://*|https://*|file://*) url="$1" ;;
   esac
   shift
 done
 case "$method $url" in
+  "GET "*/bin/cbde|"GET file://"*)
+    [ -n "${STUB_CURL_FAIL:-}" ] && exit 22
+    cat "${STUB_CURL_FILE:?}" ;;
   "GET "*/tags/list) printf '%s' "${STUB_TAGS_JSON:-{\"tags\":[\"0.2.0\",\"latest\"]\}}" ;;
   "GET "*/manifests/*)
     tag="${url##*/}"; digest=sha256:aaa
