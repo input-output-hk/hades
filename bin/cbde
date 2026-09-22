@@ -120,7 +120,8 @@ Toolchain (forwarded to cbde inside the container):
 
 Host side:
   cbde registry up|down       run a local registry on :$LOCAL_REGISTRY_PORT and point cbde at it / undo
-  cbde registry push [m...]   push local cbde:<matrix> images to the current registry
+  cbde registry push [m...]   push local cbde:<matrix> images to the current registry as
+                              <m>-<arch> and merge them into the multi-arch tag <m> (--yes: no prompt)
   cbde registry list          tags in the current registry
   cbde registry rm <tag>      remove a tag from the local registry (and the tags sharing its image)
   cbde registry status        what is running, what cbde uses, what it holds
@@ -311,9 +312,23 @@ cmd_registry_up() {
     printf 'cbde: local registry started on :%s (blobs kept in volume %s-data)\n' "$LOCAL_REGISTRY_PORT" "$LOCAL_REGISTRY_NAME" >&2
   fi
   cfg_set registry "$LOCAL_REGISTRY"
+  local_registry_reachable
   printf 'cbde: registry is now %s  (%s)\n' "$LOCAL_REGISTRY" "$CFG" >&2
   [ -z "${CBDE_REGISTRY:-}" ] || note "cbde: CBDE_REGISTRY=$CBDE_REGISTRY is set in this shell and overrides the file"
   printf 'cbde: publish your local images into it with:  cbde registry push\n' >&2
+}
+
+# Is it the registry that answers on the host's port? On macOS, AirPlay
+# Receiver (Control Center) holds :5000 and answers every request 403; the
+# push then works (the daemon reaches the container from inside the VM) but
+# buildx and curl on the host talk to AirPlay. Say so instead of "no tags".
+local_registry_reachable() {
+  command -v curl >/dev/null 2>&1 || return 0
+  local hdr; hdr="$(curl -sS --max-time 5 -o /dev/null -D - "http://localhost:$LOCAL_REGISTRY_PORT/v2/" 2>/dev/null || true)"
+  case "$hdr" in *[Rr]egistry/2.0*) return 0 ;; esac
+  note "cbde: something else answers on localhost:$LOCAL_REGISTRY_PORT (not the registry)$(printf '%s' "$hdr" | sed -n 's/^[Ss]erver: */ — Server: /p' | tr -d '\r' | head -n 1)"
+  note "cbde: on macOS that is usually AirPlay Receiver; turn it off (System Settings > General > AirDrop & Handoff) or use another port:"
+  note "cbde:   cbde registry down && CBDE_LOCAL_REGISTRY_PORT=5001 cbde registry up   (keep the variable exported for push/list/down)"
 }
 
 cmd_registry_down() {
@@ -333,16 +348,92 @@ cmd_registry_down() {
 
 # Push local cbde:<tag> images to $REGISTRY. Default: every version tag plus
 # latest, so `cbde pull` and `cbde matrix <name>` find them there.
+#
+# The published image is multi-arch (amd64 built on Linux, arm64 on Apple
+# Silicon) but a local image is one architecture, and a plain `docker push`
+# of cbde:T would replace whatever is at $REGISTRY:T with this machine's side.
+# So each side goes up under an arch tag, T-amd64 or T-arm64, and T itself is
+# rewritten as an index over every arch tag that exists — the same merge CI
+# does with `imagetools create`. A Linux box and a Mac can push in either
+# order, and re-pushing one side is idempotent. The arch tags stay in the
+# registry: they are the sources the index points at.
+ARCHES="amd64 arm64"
+have_buildx() { docker buildx version >/dev/null 2>&1 || die "docker buildx is needed for a multi-arch push (Docker Desktop and Colima ship it)"; }
+image_arch()  { docker image inspect -f '{{.Architecture}}' "$1" 2>/dev/null || true; }
+remote_ref_exists() { docker buildx imagetools inspect "$1" >/dev/null 2>&1; }
+# Which of T-amd64 / T-arm64 are in the registry, space-separated.
+remote_arches() {
+  local a out=
+  for a in $ARCHES; do remote_ref_exists "$REGISTRY:$1-$a" && out="$out$a "; done
+  printf '%s' "${out% }"
+}
+# The platforms an index serves, one line: "linux/amd64 linux/arm64".
+remote_platforms() {
+  docker buildx imagetools inspect --format '{{range .Manifest.Manifests}}{{.Platform.OS}}/{{.Platform.Architecture}} {{end}}' "$1" 2>/dev/null \
+    | tr ' ' '\n' | grep -v '^unknown/\|^$' | tr '\n' ' ' | sed 's/ $//' || true
+}
+
 cmd_registry_push() {
-  have_docker
-  local tags="$*" t
-  [ -n "$tags" ] || tags="$(docker images cbde --format '{{.Tag}}' | grep -E '^([0-9]+\.[0-9]+\.[0-9]+.*|latest)$' | sort -u | tr '\n' ' ')"
+  have_docker; have_buildx
+  local yes='' explicit='' tags='' t arch have plan=() p a parts existing
+  for t; do case "$t" in --yes|-y) yes=1 ;; *) explicit="$explicit $t" ;; esac; done
+  tags="${explicit# }"
+  # Local arch-suffixed tags (from a `cbde pull 0.2.0-arm64`) are sides, not
+  # matrices: never push them as 0.2.0-arm64-arm64.
+  [ -n "$tags" ] || tags="$(docker images cbde --format '{{.Tag}}' | grep -E '^([0-9]+\.[0-9]+\.[0-9]+.*|latest)$' \
+                              | grep -Ev -- '-(amd64|arm64)$' | sort -u | tr '\n' ' ' || true)"
   [ -n "$tags" ] || die "no local cbde:<version> images to push (cbde build first)"
+
   for t in $tags; do
     docker image inspect "cbde:$t" >/dev/null 2>&1 || die "no local image cbde:$t"
-    docker tag "cbde:$t" "$REGISTRY:$t"
-    docker push ${PLATFORM:+--platform "$PLATFORM"} "$REGISTRY:$t" || die "push of $REGISTRY:$t failed"
-    printf 'cbde: pushed %s:%s\n' "$REGISTRY" "$t" >&2
+    arch="$(image_arch "cbde:$t")"
+    case "$arch" in amd64|arm64) ;; *) die "cbde:$t has architecture '$arch'; only amd64 and arm64 are published" ;; esac
+    have="$(remote_arches "$t")"
+    plan+=("$t|$arch|$have")
+  done
+
+  # The plan, then the question. Never a surprise rewrite of a shared tag.
+  printf 'cbde: will push\n' >&2
+  for p in "${plan[@]}"; do
+    IFS='|' read -r t arch have <<< "$p"
+    printf '  %-20s ->  %s:%s-%s\n' "cbde:$t ($arch)" "$REGISTRY" "$t" "$arch" >&2
+  done
+  printf 'then rewrite\n' >&2
+  for p in "${plan[@]}"; do
+    IFS='|' read -r t arch have <<< "$p"
+    parts=
+    for a in $ARCHES; do
+      if [ "$a" = "$arch" ]; then
+        case " $have " in *" $a "*) parts="$parts + $a (replaced)" ;; *) parts="$parts + $a" ;; esac
+      else
+        case " $have " in *" $a "*) parts="$parts + $a (already there)" ;; esac
+      fi
+    done
+    printf '  %-36s = %s\n' "$REGISTRY:$t" "${parts# + }" >&2
+  done
+  if [ -z "$yes" ]; then
+    if [ -t 0 ]; then
+      printf 'continue? [y/N] ' >&2; read -r a
+      case "$a" in y|Y|yes) ;; *) printf 'aborted\n' >&2; return 1 ;; esac
+    else
+      die "re-run with: cbde registry push${explicit} --yes"
+    fi
+  fi
+
+  for p in "${plan[@]}"; do
+    IFS='|' read -r t arch have <<< "$p"
+    docker tag "cbde:$t" "$REGISTRY:$t-$arch"
+    docker push "$REGISTRY:$t-$arch" || die "push of $REGISTRY:$t-$arch failed"
+    printf 'cbde: pushed %s:%s-%s\n' "$REGISTRY" "$t" "$arch" >&2
+    # The index, rebuilt from every arch tag now present (ours included).
+    existing=
+    for a in $ARCHES; do
+      case " $have $arch " in *" $a "*) existing="$existing $REGISTRY:$t-$a" ;; esac
+    done
+    # shellcheck disable=SC2086
+    docker buildx imagetools create -t "$REGISTRY:$t" $existing || die "could not write the index $REGISTRY:$t"
+    remote_ref_exists "$REGISTRY:$t" || die "$REGISTRY:$t was written but cannot be read back"
+    printf 'cbde: %s:%s now serves: %s\n' "$REGISTRY" "$t" "$(remote_platforms "$REGISTRY:$t")" >&2
   done
 }
 
@@ -385,11 +476,25 @@ registry_tags() {
     | sed -n 's/.*"tags":\[\([^]]*\)\].*/\1/p' | tr -d '"' | tr ',' '\n' | grep . | sort -V || true
 }
 
+# Tags in the registry. The arch sources (T-amd64, T-arm64) are shown indented
+# under their index so the list reads as one line per version.
 cmd_registry_list() {
   have_curl
-  local tags; tags="$(registry_tags)"
+  local tags t a
+  tags="$(registry_tags)"
   [ -n "$tags" ] || { printf 'no tags in %s (not reachable, or empty)\n' "$REGISTRY"; return 0; }
-  printf '%s\n' "$tags" | sed "s|^|$REGISTRY:|"
+  for t in $tags; do
+    case "$t" in *-amd64|*-arm64) continue ;; esac
+    printf '%s:%s\n' "$REGISTRY" "$t"
+    for a in $ARCHES; do
+      printf '%s\n' "$tags" | grep -qx "$t-$a" && printf '    %s:%s-%s  (arch source)\n' "$REGISTRY" "$t" "$a"
+    done
+  done
+  # Sides without an index: a push that stopped between push and create.
+  for t in $tags; do
+    case "$t" in *-amd64|*-arm64) ;; *) continue ;; esac
+    printf '%s\n' "$tags" | grep -qx "${t%-*}" || printf '%s:%s  (arch source, no index %s yet)\n' "$REGISTRY" "$t" "${t%-*}"
+  done
 }
 
 # Remove one tag from the local registry. Registries delete by manifest, so
@@ -450,7 +555,7 @@ cmd_registry() {
     push)         shift; cmd_registry_push "$@" ;;
     list|ls|tags) cmd_registry_list ;;
     status|"")    cmd_registry_status ;;
-    *) die "unknown registry subcommand: $1 (up | down [--purge] | push [matrix...] | list | remove <tag> | status)" ;;
+    *) die "unknown registry subcommand: $1 (up | down [--purge] | push [matrix...] [--yes] | list | remove <tag> | status)" ;;
   esac
 }
 
@@ -465,7 +570,8 @@ version_sort() {
 }
 image_env() { docker image inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$1" 2>/dev/null || true; }
 env_get()   { printf '%s\n' "$1" | sed -n "s/^$2=//p" | head -n 1; }
-is_version() { case "$1" in [0-9]*.[0-9]*.[0-9]*) return 0 ;; *) return 1 ;; esac; }
+# A matrix tag; the arch sources a push leaves beside it (0.2.0-arm64) are not.
+is_version() { case "$1" in *-amd64|*-arm64) return 1 ;; [0-9]*.[0-9]*.[0-9]*) return 0 ;; *) return 1 ;; esac; }
 local_versions() {
   local t
   for t in $(docker images cbde --format '{{.Tag}}' 2>/dev/null); do is_version "$t" && printf '%s\n' "$t"; done

@@ -6,11 +6,16 @@
 #   STUB_PULL_FAIL      set to make `docker pull` fail
 #   STUB_CONTAINERS     names `container inspect` reports (append :stopped for a stopped one)
 #   STUB_TAGS           what `docker images cbde --format` lists
+#   STUB_ARCH           what `image inspect --format {{.Architecture}}` reports (default amd64)
+#   STUB_REMOTE_ARCH_TAGS  tags (0.2.0-amd64 latest-amd64 ...) that `buildx imagetools
+#                       inspect <ref>` finds in the registry; anything else fails, except a
+#                       ref an earlier `buildx imagetools create -t <ref>` in this log wrote
 printf 'docker %s\n' "$*" >> "${STUB_LOG:?STUB_LOG is not set}"
 case "${1:-} ${2:-}" in
   "image inspect")
     for ref; do :; done
     case " $* " in
+      *"{{.Architecture}}"*) printf '%s\n' "${STUB_ARCH:-amd64}"; exit 0 ;;
       *" -f "*|*" --format "*)
         # Env of an image: version from STUB_IMAGE_VERSION, else from the ref's
         # tag (latest -> 0.2.0). Pins default to matrix 0.2.0's; a tag's GHC
@@ -33,5 +38,20 @@ case "${1:-} ${2:-}" in
   "exec "*) exit 0 ;;
   "pull "*) [ -z "${STUB_PULL_FAIL:-}" ] || { echo "stub: pull failed" >&2; exit 1; } ;;
   "volume inspect") exit 1 ;;
+  "buildx imagetools")
+    for ref; do :; done
+    case "${3:-}" in
+      inspect)
+        tag="${ref##*:}"
+        case " ${STUB_REMOTE_ARCH_TAGS:-} " in *" $tag "*) exit 0 ;; esac
+        # An index this run wrote: its platforms are its sources' arches.
+        created="$(grep "^docker buildx imagetools create -t $ref " "$STUB_LOG" | tail -n 1 || true)"
+        [ -n "$created" ] || exit 1
+        case " $* " in *" --format "*)
+          for src in ${created#*-t "$ref" }; do printf 'linux/%s ' "${src##*-}"; done; echo ;;
+        esac
+        exit 0 ;;
+      create) exit 0 ;;
+    esac ;;
 esac
 exit 0
