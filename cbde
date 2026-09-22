@@ -8,6 +8,11 @@
 # footguns that deserve a warning rather than a confusing failure.
 set -uo pipefail
 
+# Compatibility-matrix helpers and the active_* probes live in the shared
+# library, so that the image build, this CLI and the tests agree on them.
+# shellcheck source=lib/matrix.sh
+. "${CBDE_LIB:-/usr/local/lib/cbde/matrix.sh}"
+
 GHCUP_ROOT="${GHCUP_INSTALL_BASE_PREFIX:-/nix/cbde}/.ghcup"
 GHCUP_BINDIR="$GHCUP_ROOT/bin"
 
@@ -16,16 +21,13 @@ bad()  { printf '  \033[31m✗\033[0m %s\n' "$*"; }
 note() { printf '  \033[33m!\033[0m %s\n' "$*"; }
 hdr()  { printf '\n\033[1m%s\033[0m\n' "$*"; }
 
-active_ghc()   { ghc --numeric-version 2>/dev/null; }
-active_cabal() { cabal --numeric-version 2>/dev/null; }
-active_hls()   { haskell-language-server-wrapper --numeric-version 2>/dev/null | tr -d '\n'; }
-
 installed_ghcs() { ls "$GHCUP_ROOT/ghc" 2>/dev/null; }
 installed_of() { # $1 = binary prefix, e.g. cabal- / haskell-language-server-wrapper-
   ls "$GHCUP_BINDIR" 2>/dev/null | sed -n "s/^$1\([0-9].*\)$/\1/p"
 }
 
-nix_is_mounted() { awk '$2 == "/nix" { found = 1 } END { exit !found }' /proc/self/mounts; }
+# CBDE_MOUNTS_FILE exists for the tests, which have no /nix mount to offer.
+nix_is_mounted() { awk '$2 == "/nix" { found = 1 } END { exit !found }' "${CBDE_MOUNTS_FILE:-/proc/self/mounts}"; }
 
 # plustan reads .hie files, whose format is locked to the exact GHC *patch*
 # version that produced them. The plustan binary in this image is a reader for
@@ -47,6 +49,9 @@ cbde — manage the toolchain versions in this container
   cbde hls [VERSION]      install the language server (not shipped by default)
   cbde lean [TOOLCHAIN]   show, or install+switch to, a Lean toolchain
   cbde list               what is installed, and what is active
+  cbde matrix             is the active toolchain the verified set of this image?
+  cbde matrix list        every compatibility matrix this image knows about
+  cbde matrix reset       back to the verified set (installs what is missing)
   cbde update             refresh the list of installable versions
   cbde devcontainer       write .devcontainer/devcontainer.json into this project
   cbde doctor             check this container and volume for problems
@@ -60,6 +65,9 @@ Examples
 
 Anything installed here lands in the volume mounted at /nix, so it is
 downloaded once and reused by every later container. Power users: `ghcup tui`.
+
+Switching a version moves you off the image's compatibility matrix onto a
+custom one. Nothing stops you; `cbde matrix` and `cbde doctor` say so.
 USAGE
 }
 
@@ -94,7 +102,7 @@ cmd_switch() { # $1 = tool (ghc|cabal), $2 = version (may be empty)
   if [ -z "$present" ]; then
     require_volume || return 1
     printf 'cbde: installing %s %s (this can take a few minutes)\n' "$tool" "$version"
-    ghcup install "$tool" "$version" || return 1
+    ghcup_install "$tool" "$version" || return 1
   fi
   ghcup set "$tool" "$version" || return 1
   ok "$tool $version is now active"
@@ -164,8 +172,8 @@ cmd_lean() {
   fi
   require_volume || return 1
   if ! elan toolchain list 2>/dev/null | grep -qF "$toolchain"; then
-    printf 'cbde: installing Lean toolchain %s (~2.3 GB — a few minutes)\n' "$toolchain"
-    elan toolchain install "$toolchain" || return 1
+    printf 'cbde: installing Lean toolchain %s (~2.3 GB unpacked)\n' "$toolchain"
+    lean_install "$toolchain" || return 1
   fi
   elan default "$toolchain" || return 1
   ok "Lean $toolchain is now active"
@@ -173,7 +181,7 @@ cmd_lean() {
   note "another toolchain may need 'cd /opt/blaster && lake build' again."
 }
 
-TEMPLATE=/opt/cbde/devcontainer.json
+TEMPLATE="${CBDE_TEMPLATE:-/opt/cbde/devcontainer.json}"
 
 template_version() { sed -n 's/.*"\/\/cbde-template"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$1" 2>/dev/null | head -1; }
 
@@ -212,6 +220,91 @@ cmd_devcontainer() {
   cp "$TEMPLATE" "$dest"
   ok "wrote $dest (template $(template_version "$dest"))"
   note "in VS Code: Ctrl+Shift+P -> Dev Containers: Reopen in Container"
+}
+
+image_matrix() { printf '%s' "${CBDE_IMAGE_VERSION:-}"; }
+
+# One line per known matrix; the image's own is starred.
+matrix_list_table() {
+  local own name f
+  own="$(image_matrix)"
+  [ -n "$(matrix_list)" ] || { bad "no matrices in $CBDE_MATRIX_DIR"; return 1; }
+  for name in $(matrix_list); do
+    f="$CBDE_MATRIX_DIR/$name.env"
+    printf '  %s %-8s GHC %-8s cabal %-10s Lean %-28s%s\n' \
+      "$([ "$name" = "$own" ] && printf '*' || printf ' ')" "$name" \
+      "$(matrix_get "$f" CBDE_GHC)" "$(matrix_get "$f" CBDE_CABAL)" \
+      "$(matrix_get "$f" CBDE_LEAN | sed 's|^leanprover/lean4:||')" \
+      "$([ "$name" = "$own" ] && printf '  <- this image')"
+  done
+  printf '\n  These are the matrices known when this image was built. For what actually\n'
+  printf '  exists, locally and in the registry, run on the host:  cbde matrix list\n'
+}
+
+# The full picture for one matrix: baked pins, then the switchable components
+# with what is actually active, then the verdict.
+matrix_show() {
+  local f="$1" name own
+  name="$(matrix_get "$f" CBDE_IMAGE_VERSION)"; own="$(image_matrix)"
+  if [ "$name" = "$own" ]; then hdr "Compatibility matrix $name (this image)"
+  else hdr "Compatibility matrix $name (this container is $own)"; fi
+  printf '  baked into the image:\n'
+  printf '    plustan %s   blaster %s   aiken %s   z3 %s   ghcup %s\n' \
+    "$(matrix_get "$f" PLUSTAN_REF)" "$(matrix_get "$f" BLASTER_REF)" \
+    "$(matrix_get "$f" AIKEN_VERSION)" "$(matrix_get "$f" Z3_TAG)" "$(matrix_get "$f" GHCUP_VERSION)"
+  printf '  in the volume, switchable:\n'
+  [ "$name" = "$own" ] || { matrix_status "$f" | awk -F'\t' '{ printf "    %-6s %s\n", $1, $2 }'; return 0; }
+  matrix_status "$f" | while IFS="$(printf '\t')" read -r comp want have state; do
+    case "$state" in
+      ok)       ok   "$(printf '%-6s %s' "$comp" "$want")" ;;
+      optional) printf '    %-6s not pinned%s\n' "$comp" "$([ "$have" != '(none)' ] && printf ' (installed: %s)' "$have")" ;;
+      missing)  bad  "$(printf '%-6s pinned %s, not installed' "$comp" "$want")" ;;
+      off)      note "$(printf '%-6s pinned %s, active %s' "$comp" "$want" "$have")" ;;
+    esac
+  done
+  printf '\n'
+  if matrix_status "$f" >/dev/null; then
+    ok "verified: the active toolchain is exactly matrix $name"
+  else
+    note "custom: the active toolchain differs from matrix $name — fine if deliberate;"
+    note "back to the verified set with: cbde matrix reset"
+  fi
+}
+
+# Re-apply the image's own pins, installing whatever the volume lacks. Uses the
+# same switch paths as the user-facing verbs, so warnings come out the same.
+matrix_apply() {
+  local f="$1" v rc=0
+  cmd_switch ghc   "$(matrix_get "$f" CBDE_GHC)"   || rc=1
+  cmd_switch cabal "$(matrix_get "$f" CBDE_CABAL)" || rc=1
+  v="$(matrix_get "$f" CBDE_HLS)";  [ -z "$v" ] || cmd_hls "$v"   || rc=1
+  v="$(matrix_get "$f" CBDE_LEAN)"; [ -z "$v" ] || cmd_lean "$v"  || rc=1
+  matrix_show "$f"
+  return "$rc"
+}
+
+cmd_matrix() {
+  local sub="${1:-show}" own f
+  own="$(image_matrix)"
+  case "$sub" in
+    list|ls) matrix_list_table ;;
+    show|status)
+      f="$(matrix_file "${2:-$own}")" || return $?
+      matrix_show "$f" ;;
+    reset)
+      f="$(matrix_file "$own")" || return $?
+      matrix_apply "$f" ;;
+    *)
+      matrix_name_ok "$sub" || { bad "unknown matrix subcommand: $sub (list | show [NAME] | reset)"; return 2; }
+      f="$(matrix_file "$sub")" || return $?
+      [ "$sub" != "$own" ] && {
+        bad "matrix $sub ships as its own image, cbde:$sub — this container is cbde:$own."
+        note "plustan, Blaster, Z3 and aiken are baked in, so only the whole image can move"
+        note "between matrices. On the host:   cbde matrix $sub"
+        return 2
+      }
+      matrix_apply "$f" ;;
+  esac
 }
 
 cmd_list() {
@@ -366,11 +459,29 @@ cmd_doctor() {
   if [ -f /nix/cbde/cabal/packages/hackage.haskell.org/01-index.tar ]; then
     ok "hackage index present"
   else
-    bad "hackage index missing (run: cabal update)"
+    bad "hackage index missing (run: cbde matrix reset, or: cabal update)"
     fail=1
   fi
   [ -d /nix/cbde/cabal/packages/cardano-haskell-packages ] \
     && ok "CHaP index present" || note "CHaP index missing (cabal update in a project declaring it)"
+
+  hdr "Compatibility matrix"
+  local mf
+  if [ -z "$(image_matrix)" ]; then
+    bad "CBDE_IMAGE_VERSION is not set — this image does not know which matrix it is"
+    fail=1
+  elif mf="$(matrix_file "$(image_matrix)" 2>/dev/null)"; then
+    if matrix_status "$mf" >/dev/null; then
+      ok "verified set $(image_matrix): the active toolchain is the one this image was tested with"
+    else
+      note "custom: the active toolchain differs from matrix $(image_matrix)"
+      matrix_status "$mf" | awk -F'\t' '$4 == "off" || $4 == "missing" { printf "      %-6s pinned %-28s active %s\n", $1, $2, $3 }'
+      note "fine if deliberate; back to the verified set: cbde matrix reset"
+    fi
+  else
+    bad "this image carries no matrix file for $(image_matrix) (expected $CBDE_MATRIX_DIR/$(image_matrix).env)"
+    fail=1
+  fi
 
   hdr "IDE support"
   if [ -n "$(active_hls)" ]; then
@@ -455,6 +566,7 @@ case "${1:-help}" in
   hls)    cmd_hls "${2:-}" ;;
   lean)   cmd_lean "${2:-}" ;;
   list|ls) cmd_list ;;
+  matrix) shift; cmd_matrix "$@" ;;
   update) cmd_update ;;
   devcontainer) cmd_devcontainer "${2:-}" ;;
   doctor) cmd_doctor ;;

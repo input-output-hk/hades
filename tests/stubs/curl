@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# Fake curl for the registry tests. Answers the OCI distribution calls the
+# launcher makes; everything is driven by env:
+#   STUB_TAGS_JSON   tags/list body, default {"tags":["0.2.0","latest"]}
+#   STUB_DIGESTS     "tag=digest ..." for manifests/<tag>; default: all share sha256:aaa
+#   STUB_DELETE_CODE HTTP code for DELETE, default 202
+printf 'curl %s\n' "$*" >> "${STUB_LOG:-/dev/null}"
+url=; method=GET; want_code=; dump_headers=
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -X) method="$2"; shift ;;
+    -w) want_code=1; shift ;;
+    -D) dump_headers=1; shift ;;
+    -o|-H|--max-time) shift ;;
+    http://*|https://*) url="$1" ;;
+  esac
+  shift
+done
+case "$method $url" in
+  "GET "*/tags/list) printf '%s' "${STUB_TAGS_JSON:-{\"tags\":[\"0.2.0\",\"latest\"]\}}" ;;
+  "GET "*/manifests/*)
+    tag="${url##*/}"; digest=sha256:aaa
+    for kv in ${STUB_DIGESTS:-}; do [ "${kv%%=*}" = "$tag" ] && digest="${kv#*=}"; done
+    [ "$digest" = none ] && exit 22
+    [ -n "$dump_headers" ] && printf 'HTTP/1.1 200 OK\r\nDocker-Content-Digest: %s\r\n\r\n' "$digest" ;;
+  "DELETE "*) [ -n "$want_code" ] && printf '%s' "${STUB_DELETE_CODE:-202}" ;;
+esac
+exit 0

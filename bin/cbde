@@ -20,22 +20,80 @@
 # as an unbound variable under set -u).
 set -euo pipefail
 
-IMAGE="${CBDE_IMAGE:-cbde:latest}"
-VOLUME="${CBDE_VOLUME:-cbde-data}"
+die()  { printf 'cbde: %s\n' "$*" >&2; exit 1; }
+note() { printf '\033[33m%s\033[0m\n' "$*" >&2; }
+
+# Physical paths throughout. git already resolves symlinks in --show-toplevel;
+# $PWD does not, so on macOS (/tmp -> /private/tmp, /var -> /private/var, a
+# home on an external volume) the two disagree and the relative part below
+# comes out wrong.
+physical_pwd() { pwd -P; }
+
+project_root() {
+  git rev-parse --show-toplevel 2>/dev/null || physical_pwd
+}
+
+# A project may pin the compatibility matrix it was written against in a
+# `.cbde` file at its root (`matrix=0.2.0`); the launcher then runs the image
+# of that matrix, cbde:0.2.0, instead of cbde:latest. Written by `cbde matrix`.
+PIN_FILE=.cbde
+matrix_name_ok() { case "$1" in ''|.*|*[!A-Za-z0-9._-]*) return 1 ;; *) return 0 ;; esac; }
+project_matrix() {
+  [ -f "$1/$PIN_FILE" ] || return 0
+  sed -n 's/^[[:space:]]*matrix[[:space:]]*=[[:space:]]*//p' "$1/$PIN_FILE" | head -n 1 | tr -d '[:space:]'
+}
+
+ROOT="$(project_root)"
+PIN="$(project_matrix "$ROOT")"
+[ -z "$PIN" ] || matrix_name_ok "$PIN" || die "invalid matrix name in $ROOT/$PIN_FILE: $PIN"
+
+# Per-user settings, so an override survives shells and sessions without an
+# export: ~/.config/cbde/config, `key=value` lines (registry, volume,
+# platform). Environment wins over the file, the file over the default.
+# Written by `cbde registry up/down`; editable by hand.
+CFG="${XDG_CONFIG_HOME:-$HOME/.config}/cbde/config"
+cfg() { [ -f "$CFG" ] && sed -n "s/^[[:space:]]*$1[[:space:]]*=[[:space:]]*//p" "$CFG" | head -n 1 | tr -d '[:space:]'; return 0; }
+cfg_set() {
+  mkdir -p "$(dirname "$CFG")"
+  if [ -f "$CFG" ] && grep -q "^[[:space:]]*$1[[:space:]]*=" "$CFG"; then
+    sed "s|^[[:space:]]*$1[[:space:]]*=.*|$1=$2|" "$CFG" > "$CFG.tmp" && mv "$CFG.tmp" "$CFG"
+  else
+    { [ -f "$CFG" ] || printf '# cbde settings — see: cbde help\n'; printf '%s=%s\n' "$1" "$2"; } >> "$CFG"
+  fi
+}
+cfg_unset() {
+  [ -f "$CFG" ] || return 0
+  grep -v "^[[:space:]]*$1[[:space:]]*=" "$CFG" > "$CFG.tmp" || true
+  if grep -q '^[[:space:]]*[^#[:space:]]' "$CFG.tmp"; then mv "$CFG.tmp" "$CFG"; else rm -f "$CFG.tmp" "$CFG"; fi
+}
+
+# Explicit CBDE_IMAGE wins, then the project's pin, then latest.
+IMAGE="${CBDE_IMAGE:-cbde:${PIN:-latest}}"
+VOLUME="${CBDE_VOLUME:-$(cfg volume)}"; VOLUME="${VOLUME:-cbde-data}"
 # The image is multi-arch (amd64, arm64) and Docker picks the host's native one.
 # CBDE_PLATFORM forces another, e.g. linux/amd64 on an Apple Silicon Mac to run
 # the x86_64 image under Rosetta; normally unset.
-PLATFORM="${CBDE_PLATFORM:-}"
+PLATFORM="${CBDE_PLATFORM:-$(cfg platform)}"
 # Where `cbde pull` fetches from. The image keeps its short local name
 # ($IMAGE) so the devcontainer template and every docker command in the README
 # stay valid whichever registry it came from.
-REGISTRY="${CBDE_REGISTRY:-ghcr.io/input-output-hk/cbde}"
+DEFAULT_REGISTRY=ghcr.io/input-output-hk/cbde
+REGISTRY="${CBDE_REGISTRY:-$(cfg registry)}"; REGISTRY="${REGISTRY:-$DEFAULT_REGISTRY}"
+registry_source() {
+  if [ -n "${CBDE_REGISTRY:-}" ]; then printf 'CBDE_REGISTRY'
+  elif [ -n "$(cfg registry)" ]; then printf '%s' "$CFG"
+  else printf 'default'; fi
+}
+
+# The local development registry: `cbde registry up` runs the standard
+# registry:2 image, keeps its blobs in a named volume, and points cbde at it
+# through the config file, so pushes and pulls work exactly as against GHCR.
+LOCAL_REGISTRY_NAME="${CBDE_LOCAL_REGISTRY_NAME:-cbde-registry}"
+LOCAL_REGISTRY_PORT="${CBDE_LOCAL_REGISTRY_PORT:-5000}"
+LOCAL_REGISTRY="localhost:$LOCAL_REGISTRY_PORT/cbde"
 
 HOST_OS="$(uname -s)"
 HOST_ARCH="$(uname -m)"
-
-die()  { printf 'cbde: %s\n' "$*" >&2; exit 1; }
-note() { printf '\033[33m%s\033[0m\n' "$*" >&2; }
 
 usage() {
   cat <<USAGE
@@ -49,6 +107,10 @@ cbde — run the Cardano toolchain container against the current project.
 Toolchain (forwarded to cbde inside the container):
   cbde list                   installed and active versions
   cbde doctor                 check this container, volume and platform
+  cbde matrix                 which compatibility matrix this project runs, verified or custom
+  cbde matrix list            every matrix: local images and the registry's tags
+  cbde matrix <name>          pin this project to matrix <name> (pulls cbde:<name> if needed)
+  cbde matrix unpin           back to cbde:latest
   cbde ghc [version]          show or switch GHC
   cbde cabal-version [v]      show or switch cabal
   cbde hls [version]          install the language server
@@ -57,8 +119,14 @@ Toolchain (forwarded to cbde inside the container):
   cbde update                 refresh ghcup release metadata
 
 Host side:
-  cbde pull [tag]             pull $REGISTRY:<tag> and name it $IMAGE
-  cbde build [docker args]    build the image from this repo (native arch)
+  cbde registry up|down       run a local registry on :$LOCAL_REGISTRY_PORT and point cbde at it / undo
+  cbde registry push [m...]   push local cbde:<matrix> images to the current registry
+  cbde registry list          tags in the current registry
+  cbde registry rm <tag>      remove a tag from the local registry (and the tags sharing its image)
+  cbde registry status        what is running, what cbde uses, what it holds
+  cbde pull [tag]             pull $REGISTRY:<tag> and name it cbde:<tag> and cbde:<version>
+  cbde build [--matrix <name>] [docker args]
+                              build matrix <name> (default: newest) from this repo, native arch
   cbde volume [info|rm]       inspect or delete the $VOLUME volume
   cbde info                   show what image, volume, platform and paths resolve to
   cbde upgrade                update the launcher and image   (not yet built)
@@ -66,26 +134,17 @@ Host side:
   cbde help
 
 Environment:
-  CBDE_IMAGE=$IMAGE
+  CBDE_IMAGE=$IMAGE${PIN:+   (project pinned to matrix $PIN)}
   CBDE_VOLUME=$VOLUME
   CBDE_PLATFORM=${PLATFORM:-(native)}
-  CBDE_REGISTRY=$REGISTRY
+  CBDE_REGISTRY=$REGISTRY   (from: $(registry_source))
+  Settings file: $CFG   (registry=, volume=, platform=)
   CBDE_DOCKER_ARGS   extra docker run flags (e.g. '-p 8080:8080 -v ~/x:/x')
   CBDE_GHC / CBDE_CABAL / CBDE_HLS / CBDE_LEAN   forwarded when set
 USAGE
 }
 
 have_docker() { command -v docker >/dev/null 2>&1 || die "docker is not installed or not on PATH"; }
-
-# Physical paths throughout. git already resolves symlinks in --show-toplevel;
-# $PWD does not, so on macOS (/tmp -> /private/tmp, /var -> /private/var, a
-# home on an external volume) the two disagree and the relative part below
-# comes out wrong.
-physical_pwd() { pwd -P; }
-
-project_root() {
-  git rev-parse --show-toplevel 2>/dev/null || physical_pwd
-}
 
 # Everything below /workspace mirrors the host layout, so a run started three
 # directories deep lands three directories deep.
@@ -101,9 +160,9 @@ image_present() { docker image inspect "$IMAGE" >/dev/null 2>&1; }
 
 docker_run() {
   have_docker
-  image_present || die "image $IMAGE not found — run 'cbde pull' or 'cbde build'"
+  image_present || die "image $IMAGE not found — run 'cbde pull${PIN:+ $PIN}' or 'cbde build${PIN:+ --matrix $PIN}'"
 
-  local root; root="$(project_root)"
+  local root="$ROOT"
   local wd;   wd="$(workdir_in_container "$root")"
 
   local flags=(--rm)
@@ -161,30 +220,321 @@ cmd_volume() {
   esac
 }
 
-# `cbde pull [tag]` fetches from the registry and gives the result the local
-# name everything else uses. A ref containing a slash is taken verbatim, so
+# The matrix an image was built as, read from its environment.
+image_version() { docker image inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$1" 2>/dev/null | sed -n 's/^CBDE_IMAGE_VERSION=//p' | head -n 1 || true; }
+
+# Give an image ref every local name it deserves: cbde:<tag> as requested,
+# cbde:<version> for what it really is, and $IMAGE if that was set explicitly.
+tag_locally() {
+  local ref="$1" tag="$2" version t done=" $ref "
+  version="$(image_version "$ref")"
+  for t in "cbde:$tag" ${version:+"cbde:$version"} ${CBDE_IMAGE:+"$CBDE_IMAGE"}; do
+    case "$done" in *" $t "*) continue ;; esac
+    docker tag "$ref" "$t"; done="$done$t "
+  done
+  printf 'cbde: %s is now cbde:%s%s\n' "$ref" "$tag" "${version:+ (matrix $version, also cbde:$version)}" >&2
+}
+
+# `cbde pull [tag]` fetches from the registry and gives the result its local
+# names. A ref containing a slash is taken verbatim, so
 # `cbde pull ghcr.io/someone/cbde:dev` works for forks.
 cmd_pull() {
   have_docker
-  local ref="${1:-latest}"
+  local ref="${1:-latest}" tag
   case "$ref" in
-    */*) ;;
-    *)   ref="$REGISTRY:$ref" ;;
+    */*) tag="${ref##*:}"; case "$tag" in */*) tag=latest ;; esac ;;
+    *)   tag="$ref"; ref="$REGISTRY:$ref" ;;
   esac
   docker pull ${PLATFORM:+--platform "$PLATFORM"} "$ref"
-  [ "$ref" = "$IMAGE" ] || docker tag "$ref" "$IMAGE"
-  printf 'cbde: %s is now %s\n' "$ref" "$IMAGE" >&2
+  tag_locally "$ref" "$tag"
 }
 
+# Pin the project to a matrix: make sure its image is here, record the pin,
+# and keep an existing devcontainer.json on the same image.
+write_pin() {
+  local f="$ROOT/$PIN_FILE"
+  if [ -f "$f" ] && grep -q '^[[:space:]]*matrix[[:space:]]*=' "$f"; then
+    sed 's/^[[:space:]]*matrix[[:space:]]*=.*/matrix='"$1"'/' "$f" > "$f.tmp" && mv "$f.tmp" "$f"
+  else
+    { [ -f "$f" ] || printf '# CBDE project settings — see: cbde matrix\n'; printf 'matrix=%s\n' "$1"; } >> "$f"
+  fi
+}
+
+remove_pin() {
+  local f="$ROOT/$PIN_FILE"
+  [ -f "$f" ] || return 0
+  grep -v '^[[:space:]]*matrix[[:space:]]*=' "$f" > "$f.tmp" || true
+  if grep -q '^[[:space:]]*[^#[:space:]]' "$f.tmp"; then mv "$f.tmp" "$f"; else rm -f "$f.tmp" "$f"; fi
+}
+
+devcontainer_follow() { # NAME: point .devcontainer/devcontainer.json's image at cbde:NAME
+  local dc="$ROOT/.devcontainer/devcontainer.json"
+  [ -f "$dc" ] || return 0
+  grep -q '"image"[[:space:]]*:[[:space:]]*"cbde:' "$dc" || return 0
+  sed 's/\("image"[[:space:]]*:[[:space:]]*"cbde:\)[^"]*"/\1'"$1"'"/' "$dc" > "$dc.tmp" && mv "$dc.tmp" "$dc"
+  printf 'cbde: .devcontainer/devcontainer.json now uses cbde:%s\n' "$1" >&2
+}
+
+pin_matrix() {
+  local name="$1" ref
+  matrix_name_ok "$name" || die "invalid matrix name: $name"
+  have_docker
+  if ! docker image inspect "cbde:$name" >/dev/null 2>&1; then
+    ref="$REGISTRY:$name"
+    note "cbde: cbde:$name is not here yet — pulling $ref"
+    docker pull ${PLATFORM:+--platform "$PLATFORM"} "$ref" \
+      || die "could not pull $ref. From a checkout you can build it: cbde build --matrix $name"
+    tag_locally "$ref" "$name"
+  fi
+  write_pin "$name"
+  devcontainer_follow "$name"
+  printf 'cbde: project %s pinned to matrix %s (image cbde:%s) in %s\n' "$ROOT" "$name" "$name" "$PIN_FILE" >&2
+  [ -z "${CBDE_IMAGE:-}" ] || note "cbde: note that CBDE_IMAGE=$CBDE_IMAGE overrides the pin while it is set"
+}
+
+# ---- local registry --------------------------------------------------------
+registry_running() { docker container inspect -f '{{.State.Running}}' "$LOCAL_REGISTRY_NAME" 2>/dev/null | grep -q true; }
+
+cmd_registry_up() {
+  have_docker
+  if registry_running; then
+    note "cbde: local registry $LOCAL_REGISTRY_NAME already running on :$LOCAL_REGISTRY_PORT"
+  elif docker container inspect "$LOCAL_REGISTRY_NAME" >/dev/null 2>&1; then
+    docker start "$LOCAL_REGISTRY_NAME" >/dev/null
+    printf 'cbde: local registry restarted on :%s\n' "$LOCAL_REGISTRY_PORT" >&2
+  else
+    # Deletes are off by default in registry:2; `cbde registry rm` needs them.
+    docker run -d --name "$LOCAL_REGISTRY_NAME" --restart unless-stopped \
+      -p "$LOCAL_REGISTRY_PORT:5000" -v "$LOCAL_REGISTRY_NAME-data:/var/lib/registry" \
+      -e REGISTRY_STORAGE_DELETE_ENABLED=true \
+      registry:2 >/dev/null
+    printf 'cbde: local registry started on :%s (blobs kept in volume %s-data)\n' "$LOCAL_REGISTRY_PORT" "$LOCAL_REGISTRY_NAME" >&2
+  fi
+  cfg_set registry "$LOCAL_REGISTRY"
+  printf 'cbde: registry is now %s  (%s)\n' "$LOCAL_REGISTRY" "$CFG" >&2
+  [ -z "${CBDE_REGISTRY:-}" ] || note "cbde: CBDE_REGISTRY=$CBDE_REGISTRY is set in this shell and overrides the file"
+  printf 'cbde: publish your local images into it with:  cbde registry push\n' >&2
+}
+
+cmd_registry_down() {
+  have_docker
+  local purge="${1:-}"
+  docker rm -f "$LOCAL_REGISTRY_NAME" >/dev/null 2>&1 && printf 'cbde: local registry stopped and removed\n' >&2 \
+    || printf 'cbde: local registry was not running\n' >&2
+  if [ "$purge" = --purge ]; then
+    docker volume rm "$LOCAL_REGISTRY_NAME-data" >/dev/null 2>&1 && printf 'cbde: its blobs (volume %s-data) deleted\n' "$LOCAL_REGISTRY_NAME" >&2
+  else
+    printf 'cbde: its blobs are kept in volume %s-data (cbde registry down --purge removes them)\n' "$LOCAL_REGISTRY_NAME" >&2
+  fi
+  [ "$(cfg registry)" = "$LOCAL_REGISTRY" ] && cfg_unset registry
+  local now; now="${CBDE_REGISTRY:-$(cfg registry)}"
+  printf 'cbde: registry is now %s  (%s)\n' "${now:-$DEFAULT_REGISTRY}" "$(registry_source)" >&2
+}
+
+# Push local cbde:<tag> images to $REGISTRY. Default: every version tag plus
+# latest, so `cbde pull` and `cbde matrix <name>` find them there.
+cmd_registry_push() {
+  have_docker
+  local tags="$*" t
+  [ -n "$tags" ] || tags="$(docker images cbde --format '{{.Tag}}' | grep -E '^([0-9]+\.[0-9]+\.[0-9]+.*|latest)$' | sort -u | tr '\n' ' ')"
+  [ -n "$tags" ] || die "no local cbde:<version> images to push (cbde build first)"
+  for t in $tags; do
+    docker image inspect "cbde:$t" >/dev/null 2>&1 || die "no local image cbde:$t"
+    docker tag "cbde:$t" "$REGISTRY:$t"
+    docker push ${PLATFORM:+--platform "$PLATFORM"} "$REGISTRY:$t" || die "push of $REGISTRY:$t failed"
+    printf 'cbde: pushed %s:%s\n' "$REGISTRY" "$t" >&2
+  done
+}
+
+# The OCI distribution API, which registry:2 and GHCR both speak. Plain HTTP
+# for localhost, HTTPS elsewhere; GHCR needs a token for anything but a public
+# package's pulls, so `rm` is local-only.
+registry_url() { # -> http(s)://host/v2/name
+  local host="${REGISTRY%%/*}" name="${REGISTRY#*/}" scheme=https
+  case "$host" in localhost*|127.0.0.1*) scheme=http ;; esac
+  printf '%s://%s/v2/%s' "$scheme" "$host" "$name"
+}
+have_curl() { command -v curl >/dev/null 2>&1 || die "curl is needed to talk to the registry"; }
+registry_tags() {
+  curl -fsS --max-time 5 "$(registry_url)/tags/list" 2>/dev/null \
+    | sed -n 's/.*"tags":\[\([^]]*\)\].*/\1/p' | tr -d '"' | tr ',' '\n' | grep . | sort -V || true
+}
+
+cmd_registry_list() {
+  have_curl
+  local tags; tags="$(registry_tags)"
+  [ -n "$tags" ] || { printf 'no tags in %s (not reachable, or empty)\n' "$REGISTRY"; return 0; }
+  printf '%s\n' "$tags" | sed "s|^|$REGISTRY:|"
+}
+
+# Remove one tag from the local registry. Registries delete by manifest, so
+# every tag that points at the same image goes with it (typically <version>
+# and latest); the user is told which before anything happens.
+cmd_registry_rm() {
+  have_curl; have_docker
+  local tag="${1:-}" digest others
+  [ -n "$tag" ] || die "registry rm: which tag? (cbde registry list)"
+  [ "$REGISTRY" = "$LOCAL_REGISTRY" ] \
+    || die "registry rm works on the local registry only; $REGISTRY is managed elsewhere (GHCR: the package's settings page)"
+  digest="$(curl -fsS --max-time 5 -o /dev/null -D - \
+      -H 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json' \
+      "$(registry_url)/manifests/$tag" 2>/dev/null | sed -n 's/^[Dd]ocker-[Cc]ontent-[Dd]igest: *//p' | tr -d '\r' || true)"
+  [ -n "$digest" ] || die "no tag $tag in $REGISTRY (cbde registry list)"
+  # Which other tags share the manifest?
+  others="$(for t in $(registry_tags); do
+      [ "$t" = "$tag" ] && continue
+      d="$(curl -fsS --max-time 5 -o /dev/null -D - -H 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json' "$(registry_url)/manifests/$t" 2>/dev/null | sed -n 's/^[Dd]ocker-[Cc]ontent-[Dd]igest: *//p' | tr -d '\r' || true)"
+      [ "$d" = "$digest" ] && printf '%s ' "$t"
+    done; true)"
+  if [ -n "$others" ] && [ "${2:-}" != --yes ]; then
+    printf 'cbde: %s shares its image with: %s — removing it removes those too.\n' "$tag" "$others" >&2
+    if [ -t 0 ]; then
+      printf 'continue? [y/N] ' >&2; local a; read -r a
+      case "$a" in y|Y|yes) ;; *) printf 'aborted\n' >&2; return 1 ;; esac
+    else
+      die "re-run with: cbde registry rm $tag --yes"
+    fi
+  fi
+  local code; code="$(curl -sS --max-time 10 -o /dev/null -w '%{http_code}' -X DELETE "$(registry_url)/manifests/$digest")"
+  case "$code" in
+    202) printf 'cbde: removed %s:%s%s\n' "$REGISTRY" "$tag" "${others:+ (and $others)}" >&2 ;;
+    405) die "this registry has deletes disabled — recreate it once with: cbde registry down && cbde registry up" ;;
+    *)   die "delete failed (HTTP $code)" ;;
+  esac
+  # Unreferenced blobs stay on disk until garbage-collected.
+  docker exec "$LOCAL_REGISTRY_NAME" registry garbage-collect --delete-untagged /etc/docker/registry/config.yml >/dev/null 2>&1 \
+    && printf 'cbde: garbage-collected the registry volume\n' >&2 || true
+}
+
+cmd_registry_status() {
+  have_docker
+  printf 'registry   %s  (from: %s)\n' "$REGISTRY" "$(registry_source)"
+  if registry_running; then printf 'local      %s running on :%s\n' "$LOCAL_REGISTRY_NAME" "$LOCAL_REGISTRY_PORT"
+  else printf 'local      not running (cbde registry up)\n'; fi
+  if command -v curl >/dev/null 2>&1; then
+    local tags; tags="$(registry_tags | tr '\n' ' ')"
+    printf 'tags       %s\n' "${tags:-(none, or registry not reachable)}"
+  fi
+}
+
+cmd_registry() {
+  case "${1:-status}" in
+    up|start)     cmd_registry_up ;;
+    down|stop)    shift; cmd_registry_down "${1:-}" ;;
+    rm|remove)    shift; cmd_registry_rm "$@" ;;
+    push)         shift; cmd_registry_push "$@" ;;
+    list|ls|tags) cmd_registry_list ;;
+    status|"")    cmd_registry_status ;;
+    *) die "unknown registry subcommand: $1 (up | down [--purge] | push [matrix...] | list | remove <tag> | status)" ;;
+  esac
+}
+
+# ---- the matrix list, from what actually exists -----------------------------
+# Not from the catalog baked into an image (stale the day a new matrix ships),
+# but from the two live sources: local cbde:<version> images, whose pins are in
+# their config, and the registry's tag list.
+version_sort() {
+  local input; input="$(cat)"
+  [ -n "$input" ] || return 0
+  printf '%s\n' "$input" | sort -V 2>/dev/null || printf '%s\n' "$input" | sort -t. -k1,1n -k2,2n -k3,3n
+}
+image_env() { docker image inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$1" 2>/dev/null || true; }
+env_get()   { printf '%s\n' "$1" | sed -n "s/^$2=//p" | head -n 1; }
+is_version() { case "$1" in [0-9]*.[0-9]*.[0-9]*) return 0 ;; *) return 1 ;; esac; }
+local_versions() {
+  local t
+  for t in $(docker images cbde --format '{{.Tag}}' 2>/dev/null); do is_version "$t" && printf '%s\n' "$t"; done
+  return 0
+}
+
+cmd_matrix_list() {
+  have_docker
+  local locals remotes reg_note= all v env where pins star own latest_v
+  locals="$(local_versions)"
+  if command -v curl >/dev/null 2>&1; then
+    remotes="$(for t in $(registry_tags); do is_version "$t" && printf '%s\n' "$t"; done; true)"
+    [ -n "$(registry_tags)" ] || reg_note="not reachable, or empty"
+  else
+    reg_note="curl not installed, registry not consulted"
+  fi
+  all="$(printf '%s\n%s\n' "$locals" "$remotes" | grep . | sort -u | version_sort || true)"
+  own="${PIN:-$(env_get "$(image_env "$IMAGE")" CBDE_IMAGE_VERSION)}"
+  latest_v="$(env_get "$(image_env cbde:latest)" CBDE_IMAGE_VERSION)"
+  if [ -z "$all" ]; then
+    printf 'no matrices: no local cbde:<version> image and nothing in %s%s\n' "$REGISTRY" "${reg_note:+ ($reg_note)}"
+    printf 'build one (cbde build) or pull one (cbde pull)\n'
+    return 0
+  fi
+  for v in $all; do
+    star=' '; [ "$v" = "$own" ] && star='*'
+    if printf '%s\n' "$locals" | grep -qx "$v"; then
+      env="$(image_env "cbde:$v")"
+      pins="$(printf 'GHC %-8s cabal %-10s Lean %-10s' "$(env_get "$env" CBDE_GHC)" "$(env_get "$env" CBDE_CABAL)" "$(env_get "$env" CBDE_LEAN | sed 's|^leanprover/lean4:||')")"
+      where=local
+      printf '%s\n' "$remotes" | grep -qx "$v" && where="$where, registry"
+      [ "$v" = "$latest_v" ] && where="$where, latest"
+    else
+      pins="$(printf '%-42s' '(in registry, not pulled)')"
+      where="cbde matrix $v  to use it"
+    fi
+    printf '  %s %-8s %s   %s%s\n' "$star" "$v" "$pins" "$where" "$([ "$v" = "$own" ] && printf '   <- this project')"
+  done
+  printf '\n  registry: %s%s\n' "$REGISTRY" "${reg_note:+  ($reg_note)}"
+}
+
+cmd_matrix() {
+  local sub="${1:-show}"
+  case "$sub" in
+    show|status)
+      printf 'project    %s\n' "$ROOT"
+      if [ -n "$PIN" ]; then printf 'pinned     matrix %s   (%s)\n' "$PIN" "$PIN_FILE"
+      else printf 'pinned     none — running cbde:latest (pin with: cbde matrix <name>)\n'; fi
+      [ -z "${CBDE_IMAGE:-}" ] || printf 'override   CBDE_IMAGE=%s\n' "$CBDE_IMAGE"
+      printf 'image      %s%s\n' "$IMAGE" "$(image_present || printf '  (not pulled)')"
+      image_present || exit 0
+      docker_run cbde matrix show ;;
+    list|ls)  cmd_matrix_list ;;
+    reset)    docker_run cbde matrix reset ;;
+    unpin)    remove_pin; printf 'cbde: pin removed, %s runs cbde:latest again\n' "$ROOT" >&2 ;;
+    *)        pin_matrix "$sub" ;;
+  esac
+}
+
+# `cbde build [--matrix NAME] [docker args]`: builds one compatibility matrix
+# from the checkout. The matrix file supplies every pin as a --build-arg, so
+# the Dockerfile's defaults never decide what gets built. The result is tagged
+# cbde:NAME, plus cbde:latest when NAME is the newest matrix (or the project's
+# pin, so `cbde build` in a pinned project builds what it runs).
 cmd_build() {
   have_docker
-  local here; here="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
+  local here name f tags
+  here="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
   [ -f "$here/Dockerfile" ] || die "no Dockerfile at $here — run this from a CBDE checkout"
+  [ -f "$here/lib/matrix.sh" ] || die "no lib/matrix.sh at $here — checkout is incomplete"
+  CBDE_MATRIX_DIR="$here/matrices"
+  # shellcheck source=lib/matrix.sh
+  . "$here/lib/matrix.sh"
+
+  name=
+  if [ "${1:-}" = --matrix ]; then name="${2:-}"; shift 2 || die "build: --matrix needs a name"; fi
+  [ -n "$name" ] || name="${PIN:-$(matrix_newest)}"
+  [ -n "$name" ] || die "no matrices in $here/matrices"
+  f="$(matrix_file "$name")" || exit $?
+  matrix_validate "$f" >&2 || die "matrix $name is malformed (see above)"
+
+  tags=(-t "cbde:$name")
+  [ "$name" = "$(matrix_newest)" ] && tags+=(-t cbde:latest)
+  [ -n "${CBDE_IMAGE:-}" ] && tags+=(-t "$CBDE_IMAGE")
+
   # Native by default. Cross-building (CBDE_PLATFORM set) goes through the
   # runtime's emulator and takes hours; the published multi-arch image is the
   # way to get the other architecture.
   [ -n "$PLATFORM" ] && note "cbde build: building $PLATFORM on $HOST_ARCH — emulated, expect hours"
-  exec docker build ${PLATFORM:+--platform "$PLATFORM"} -t "$IMAGE" "$@" "$here"
+  note "cbde build: matrix $name from $f"
+  # shellcheck disable=SC2046
+  exec docker build ${PLATFORM:+--platform "$PLATFORM"} \
+    $(matrix_build_args "$f") \
+    "${tags[@]}" "$@" "$here"
 }
 
 # Placeholders. Both are documented in the README as coming, so they explain
@@ -226,13 +576,13 @@ EOS
 }
 
 cmd_info() {
-  local root; root="$(project_root)"
   printf 'image      %s%s\n' "$IMAGE" "$(image_present && printf '' || printf '  (not pulled)')"
-  printf 'registry   %s\n' "$REGISTRY"
+  printf 'matrix     %s\n' "${PIN:-(not pinned — latest)}"
+  printf 'registry   %s  (from: %s)\n' "$REGISTRY" "$(registry_source)"
   printf 'volume     %s\n' "$VOLUME"
   printf 'platform   %s  (host: %s %s)\n' "${PLATFORM:-native}" "$HOST_OS" "$HOST_ARCH"
-  printf 'project    %s  ->  /workspace\n' "$root"
-  printf 'workdir    %s\n' "$(workdir_in_container "$root")"
+  printf 'project    %s  ->  /workspace\n' "$ROOT"
+  printf 'workdir    %s\n' "$(workdir_in_container "$ROOT")"
 }
 
 case "${1:-shell}" in
@@ -246,6 +596,8 @@ case "${1:-shell}" in
                        docker_run cbde "$@" ;;
   cabal-version)       shift; docker_run cbde cabal "$@" ;;
 
+  matrix)              shift; cmd_matrix "$@" ;;
+  registry)            shift; cmd_registry "$@" ;;
   pull)                shift; cmd_pull "${1:-}" ;;
   build)               shift; cmd_build "$@" ;;
   volume)              shift; cmd_volume "${1:-info}" ;;

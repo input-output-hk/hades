@@ -5,15 +5,33 @@
 # Lean toolchains are provisioned into a persistent volume, not baked in.
 # Design rationale and lessons: see PLAN.md (esp. §3-§5, §9).
 
-# Versions are global ARGs so the same pin reaches several stages.
+# Every pin is a global ARG so the same value reaches several stages. The
+# defaults below MUST equal matrices/<CBDE_IMAGE_VERSION>.env: the final stage
+# compares them and fails the build on drift, so the matrix file is the single
+# source of truth and this block is a mirror of it. `cbde build` and CI pass
+# the file's lines as --build-arg, which is how another matrix gets built from
+# the same Dockerfile.
+#
+# CBDE_IMAGE_VERSION is also the matrix name and the image tag. Bump it (and
+# add a matrices/ file) whenever any pin or the /nix layout changes: a volume
+# records the version that created it, and cbde-provision warns when the two
+# disagree (Docker only seeds *empty* volumes, so old volumes otherwise shadow
+# new image content).
+ARG CBDE_IMAGE_VERSION=0.2.0
 ARG CBDE_GHC=9.6.7
 ARG CBDE_CABAL=3.10.3.0
+ARG CBDE_HLS=
+ARG CBDE_LEAN=leanprover/lean4:v4.24.0
+ARG CBDE_INDEX_STATE=2026-09-21T04:01:53Z
+ARG CBDE_CHAP_INDEX_STATE=2026-09-16T23:53:07Z
 ARG GHCUP_VERSION=0.2.6.2
-ARG LEAN_TOOLCHAIN=leanprover/lean4:v4.24.0
-# Bump whenever the /nix layout changes: a volume records the version that
-# created it, and cbde-provision warns when the two disagree (Docker only
-# seeds *empty* volumes, so old volumes otherwise shadow new image content).
-ARG CBDE_IMAGE_VERSION=0.2.0
+ARG AIKEN_VERSION=v1.1.23
+ARG Z3_TAG=z3-4.15.2
+ARG PLUSTAN_REF=main
+ARG BLASTER_REF=main
+ARG LIBSODIUM_REV=dbb48cce5429cb6585c9034f002568964f1ce567
+ARG SECP256K1_REV=ac83be33d0956faf6b7f61a60ab524ef7d6a473a
+ARG BLST_TAG=v0.3.14
 
 # ---------------------------------------------------------------------------
 # Stage 1: build the Cardano crypto C libraries from source.
@@ -32,7 +50,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # IOG libsodium fork (iohk-stable-vmm), pinned as in cardano-node docs.
-ARG LIBSODIUM_REV=dbb48cce5429cb6585c9034f002568964f1ce567
+ARG LIBSODIUM_REV
 RUN git clone https://github.com/input-output-hk/libsodium /tmp/libsodium \
     && cd /tmp/libsodium && git checkout "$LIBSODIUM_REV" \
     && ./autogen.sh \
@@ -43,7 +61,7 @@ RUN git clone https://github.com/input-output-hk/libsodium /tmp/libsodium \
     && make -j"$(nproc)" && make install
 
 # libsecp256k1, pinned as in cardano-node docs.
-ARG SECP256K1_REV=ac83be33d0956faf6b7f61a60ab524ef7d6a473a
+ARG SECP256K1_REV
 RUN git clone https://github.com/bitcoin-core/secp256k1 /tmp/secp256k1 \
     && cd /tmp/secp256k1 && git checkout "$SECP256K1_REV" \
     && ./autogen.sh \
@@ -51,7 +69,7 @@ RUN git clone https://github.com/bitcoin-core/secp256k1 /tmp/secp256k1 \
     && make -j"$(nproc)" && make install
 
 # blst v0.3.14 (static lib + headers + pkg-config file; upstream ships no .pc).
-ARG BLST_TAG=v0.3.14
+ARG BLST_TAG
 RUN git clone --depth 1 --branch "$BLST_TAG" https://github.com/supranational/blst /tmp/blst \
     && cd /tmp/blst && ./build.sh \
     && install -Dm644 libblst.a /usr/local/lib/libblst.a \
@@ -70,7 +88,8 @@ RUN git clone --depth 1 --branch "$BLST_TAG" https://github.com/supranational/bl
        } > /usr/local/lib/pkgconfig/libblst.pc
 
 # ---------------------------------------------------------------------------
-# Stage 2: base — system layer. Carries ghcup itself but NO GHC and NO HLS.
+# Stage 2: base — system layer. Carries ghcup itself but NO installed GHC and
+# NO HLS; the final stage adds the matrix's compressed bindists as a seed.
 # ---------------------------------------------------------------------------
 FROM ubuntu:24.04 AS base
 
@@ -129,13 +148,18 @@ RUN case "$TARGETARCH" in amd64) m=x86_64 ;; arm64) m=aarch64 ;; *) echo "unsupp
 # and therefore need symlinks, ghcup takes this as an environment variable.
 ARG CBDE_GHC
 ARG CBDE_CABAL
+ARG CBDE_HLS
+ARG CBDE_INDEX_STATE
+ARG CBDE_CHAP_INDEX_STATE
 ARG CBDE_IMAGE_VERSION
 ENV GHCUP_INSTALL_BASE_PREFIX=/nix/cbde \
     GHCUP_SKIP_UPDATE_CHECK=1 \
     PATH=/nix/cbde/.ghcup/bin:$PATH \
     CBDE_GHC=${CBDE_GHC} \
     CBDE_CABAL=${CBDE_CABAL} \
-    CBDE_HLS= \
+    CBDE_HLS=${CBDE_HLS} \
+    CBDE_INDEX_STATE=${CBDE_INDEX_STATE} \
+    CBDE_CHAP_INDEX_STATE=${CBDE_CHAP_INDEX_STATE} \
     CBDE_IMAGE_VERSION=${CBDE_IMAGE_VERSION}
 
 # Nix (single-user, no daemon — containers have no systemd).
@@ -207,13 +231,40 @@ CMD ["bash"]
 # Stage 2b: toolchain — base with the pinned GHC/cabal materialized into the
 # image layer, for the build stages that need a compiler. Uses the exact same
 # provisioning code path as the runtime, so the two cannot drift.
+#
+# It also produces the SEED: `ghcup prefetch` downloads the matrix's GHC and
+# cabal bindists (~210 MB, xz) into /opt/cbde/seed under exactly the names
+# ghcup will look for on this architecture and distro. The provisioner then
+# installs from that seed with CBDE_SEED_STRICT=1, so the build itself proves
+# the offline path works; the final stage ships the seed so a fresh volume
+# gets GHC and cabal from the image, no network.
 # ---------------------------------------------------------------------------
 FROM base AS toolchain
-# Only the provisioner, so that edits to the `cbde` CLI or the entrypoint do
-# not invalidate this stage and force plu-stan to rebuild from scratch.
+# Only the provisioner and its library, so that edits to the `cbde` CLI or the
+# entrypoint do not invalidate this stage and force plu-stan to rebuild.
 COPY cbde-provision /usr/local/bin/
-RUN CBDE_FORCE_PROVISION=1 cbde-provision \
+COPY lib/matrix.sh /usr/local/lib/cbde/matrix.sh
+ARG CBDE_GHC
+ARG CBDE_CABAL
+RUN mkdir -p /nix/cbde/.ghcup/bin /nix/cbde/.ghcup/cache /opt/cbde/seed \
+    && cp /opt/cbde/ghcup /nix/cbde/.ghcup/bin/ghcup \
+    && cp /opt/cbde/ghcup-0.1.0.yaml /nix/cbde/.ghcup/cache/ \
+    && ghcup prefetch -d /opt/cbde/seed ghc "$CBDE_GHC" \
+    && ghcup prefetch -d /opt/cbde/seed cabal "$CBDE_CABAL" \
+    && ls -la /opt/cbde/seed \
+    && CBDE_FORCE_PROVISION=1 CBDE_SEED_STRICT=1 cbde-provision \
     && ghc --version && cabal --version
+
+# The index seed: the Hackage and CHaP indices the provisioner just fetched at
+# the matrix's pinned index-states, packed as-is (xz, ~75 MB of 1.2 GB). The
+# 01-index.tar.gz download copy is left out: it compresses no further and
+# cabal only wants it for incremental updates, which are online anyway.
+RUN cd /nix/cbde/cabal/packages \
+    && [ -f hackage.haskell.org/01-index.tar ] && [ -f cardano-haskell-packages/01-index.tar ] \
+    && tar -c --exclude='*/01-index.tar.gz' hackage.haskell.org cardano-haskell-packages \
+       | xz -T0 -6 > /opt/cbde/seed/cabal-packages.tar.xz \
+    && xz -t /opt/cbde/seed/cabal-packages.tar.xz \
+    && ls -la /opt/cbde/seed
 
 # ---------------------------------------------------------------------------
 # Stage 3: build plu-stan.
@@ -226,7 +277,7 @@ RUN CBDE_FORCE_PROVISION=1 cbde-provision \
 FROM toolchain AS plustan-builder
 
 ARG PLUSTAN_REPO=https://github.com/input-output-hk/plu-stan
-ARG PLUSTAN_REF=main
+ARG PLUSTAN_REF
 RUN git clone --depth 1 --branch "$PLUSTAN_REF" "$PLUSTAN_REPO" /opt/plu-stan
 
 WORKDIR /opt/plu-stan
@@ -245,7 +296,7 @@ RUN --mount=type=cache,target=/nix/cbde/cabal/store,sharing=locked \
 # ---------------------------------------------------------------------------
 FROM base AS aiken-dl
 
-ARG AIKEN_VERSION=v1.1.23
+ARG AIKEN_VERSION
 ARG TARGETARCH
 RUN case "$TARGETARCH" in amd64) t=x86_64-unknown-linux-musl ;; arm64) t=aarch64-unknown-linux-musl ;; *) exit 1 ;; esac \
     && curl -fsSL \
@@ -268,26 +319,37 @@ FROM ubuntu:24.04 AS blaster-builder
 
 ARG DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      build-essential git curl ca-certificates python3 libgmp-dev zlib1g-dev \
+      build-essential git curl ca-certificates python3 libgmp-dev zlib1g-dev xz-utils \
     && rm -rf /var/lib/apt/lists/*
 
-ARG Z3_TAG=z3-4.15.2
+ARG Z3_TAG
 RUN git clone --depth 1 --branch "$Z3_TAG" https://github.com/Z3Prover/z3 /tmp/z3 \
     && cd /tmp/z3 && python3 scripts/mk_make.py --prefix=/usr/local \
     && cd build && make -j"$(nproc)" && make install
 
-ARG LEAN_TOOLCHAIN
+ARG CBDE_LEAN
 RUN curl -sSfL https://elan.lean-lang.org/elan-init.sh \
-      | sh -s -- -y --default-toolchain "$LEAN_TOOLCHAIN" \
+      | sh -s -- -y --default-toolchain "$CBDE_LEAN" \
     && /root/.elan/bin/lean --version
 ENV PATH=/root/.elan/bin:$PATH
 
 ARG BLASTER_REPO=https://github.com/input-output-hk/Lean-blaster
-ARG BLASTER_REF=main
+ARG BLASTER_REF
 RUN git clone --depth 1 --branch "$BLASTER_REF" "$BLASTER_REPO" /opt/blaster \
     && cd /opt/blaster \
     && lake build \
     && lake build z3check && lake exe z3check
+
+# The Lean seed: elan's toolchain directory, packed as-is (xz -6, ~390 MB of
+# 2.3 GB; ~90 s with all cores). lean_install in lib/matrix.sh unpacks it into
+# a fresh volume with no network. The directory name is what elan derives from
+# the toolchain name (/ -> --, : -> ---); the library computes the same.
+RUN d="$(printf '%s' "$CBDE_LEAN" | sed 's|/|--|g; s|:|---|g')" \
+    && [ -d "/root/.elan/toolchains/$d" ] \
+    && mkdir -p /opt/cbde/seed \
+    && tar -C /root/.elan/toolchains -c "$d" | xz -T0 -6 > "/opt/cbde/seed/lean-$d.tar.xz" \
+    && xz -t "/opt/cbde/seed/lean-$d.tar.xz" \
+    && ls -la /opt/cbde/seed
 
 # ---------------------------------------------------------------------------
 # Stage 4: final image = base + tool binaries.
@@ -300,11 +362,48 @@ RUN git config --system --add safe.directory '*'
 
 # The `cbde` runtime user is created in the base stage (it owns /nix there).
 COPY cbde-provision cbde-entrypoint cbde /usr/local/bin/
+COPY lib/matrix.sh /usr/local/lib/cbde/matrix.sh
+
+# The seed: this matrix's GHC and cabal bindists, its Lean toolchain and its
+# package indices, unpacked into a fresh volume by the provisioner without
+# touching the network (see the toolchain and blaster-builder stages).
+# ~680 MB compressed in total.
+COPY --from=toolchain /opt/cbde/seed /opt/cbde/seed
+COPY --from=blaster-builder /opt/cbde/seed /opt/cbde/seed
+
+# The catalog of compatibility matrices, so `cbde matrix list` works offline,
+# and the drift check: this image's ARGs must equal its own matrix file. Pass
+# --build-arg CBDE_MATRIX_CHECK=0 for a one-off experimental build.
+COPY matrices /opt/cbde/matrices
+ARG CBDE_MATRIX_CHECK=1
+ARG CBDE_IMAGE_VERSION
+ARG CBDE_GHC
+ARG CBDE_CABAL
+ARG CBDE_HLS
+ARG CBDE_LEAN
+ARG CBDE_INDEX_STATE
+ARG CBDE_CHAP_INDEX_STATE
+ARG GHCUP_VERSION
+ARG AIKEN_VERSION
+ARG Z3_TAG
+ARG PLUSTAN_REF
+ARG BLASTER_REF
+ARG LIBSODIUM_REV
+ARG SECP256K1_REV
+ARG BLST_TAG
+RUN [ "$CBDE_MATRIX_CHECK" = 0 ] || bash -e -c '\
+      . /usr/local/lib/cbde/matrix.sh; \
+      f="/opt/cbde/matrices/$CBDE_IMAGE_VERSION.env"; \
+      [ -f "$f" ] || { echo "no matrix file for CBDE_IMAGE_VERSION=$CBDE_IMAGE_VERSION: add matrices/$CBDE_IMAGE_VERSION.env" >&2; exit 1; }; \
+      matrix_validate "$f" && matrix_check_env "$f" \
+        || { echo "Dockerfile ARG defaults drifted from $f — fix the matrix or pass its lines as --build-arg (cbde build does)" >&2; exit 1; }'
 
 # The devcontainer template, so `cbde devcontainer` can drop it into a project
 # from inside the container and `cbde doctor` can tell whether a project's copy
-# is current. Stamped with the image version at build time.
-COPY .devcontainer/devcontainer.json /opt/cbde/devcontainer.json
+# is current. Stamped with the image version at build time. It lives under
+# templates/ in the repo: this checkout is the tool, not a Cardano project,
+# and has no .devcontainer of its own.
+COPY templates/devcontainer.json /opt/cbde/devcontainer.json
 ARG CBDE_IMAGE_VERSION
 RUN sed -i "s/\"\/\/cbde-template\": \"dev\"/\"\/\/cbde-template\": \"${CBDE_IMAGE_VERSION}\"/" \
       /opt/cbde/devcontainer.json \
@@ -327,8 +426,8 @@ ENV CBDE_PLUSTAN_GHC=${CBDE_GHC}
 # /root/.elan stays a symlink rather than switching to ELAN_HOME: the .lake
 # artifacts in /opt/blaster were built with the toolchain resolved through that
 # path, so keeping it identical is what makes the prebuilt checkout usable.
-ARG LEAN_TOOLCHAIN
-ENV CBDE_LEAN=${LEAN_TOOLCHAIN}
+ARG CBDE_LEAN
+ENV CBDE_LEAN=${CBDE_LEAN}
 COPY --from=blaster-builder /root/.elan/bin /opt/cbde/elan-bin
 COPY --from=blaster-builder /usr/local/bin/z3 /usr/local/bin/z3
 COPY --from=blaster-builder /usr/local/lib/libz3.so* /usr/local/lib/

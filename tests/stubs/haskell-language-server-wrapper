@@ -1,0 +1,2 @@
+#!/usr/bin/env bash
+v="${STUB_HLS-}"; [ -n "$v" ] || exit 1; echo "$v"
