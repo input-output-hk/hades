@@ -39,6 +39,65 @@ test_pin_file_tolerates_whitespace_and_comments() {
   assert_contains "$out" "image      cbde:0.1.0"
 }
 
+test_local_file_pin_wins_over_the_team_pin() {
+  mkrepo p && cd p
+  printf 'matrix=0.2.0\n' > .cbde
+  printf 'matrix=0.1.0\n' > .cbde.local
+  run "$CBDE" info
+  assert_contains "$out" "image      cbde:0.1.0  (not pulled)"
+  STUB_IMAGES="cbde:0.1.0" run "$CBDE" matrix
+  assert_contains "$out" "pinned     matrix 0.1.0   (.cbde.local)"
+  printf 'ghc=9.6.6\n' > .cbde.local
+  run "$CBDE" info
+  assert_contains "$out" "image      cbde:0.2.0  (not pulled)" "no matrix= in .cbde.local: .cbde decides"
+}
+
+test_pinning_warns_when_the_local_file_overrides_the_pin() {
+  mkrepo p && cd p
+  printf 'matrix=0.1.0\n' > .cbde.local
+  STUB_IMAGES="cbde:0.2.0" run "$CBDE" matrix 0.2.0
+  assert_rc "$rc" 0 "$out"
+  assert_eq "$(sed -n 's/^matrix=//p' .cbde)" "0.2.0"
+  assert_contains "$out" "your .cbde.local still says matrix=0.1.0, which wins for you"
+}
+
+test_container_is_named_after_its_matrix_with_a_random_suffix() {
+  mkrepo p && cd p
+  STUB_IMAGES="cbde:latest" run "$CBDE" cabal --version
+  assert_rc "$rc" 0 "$out"
+  assert_match "$(last_docker)" ' --name cbde-0\.2\.0-[a-z0-9]{6} '
+  local first; first="$(last_docker | sed -n 's/.* --name \([^ ]*\) .*/\1/p')"
+  STUB_IMAGES="cbde:latest" run "$CBDE" cabal --version
+  assert_match "$(last_docker)" ' --name cbde-0\.2\.0-[a-z0-9]{6} '
+  [ "$(last_docker | sed -n 's/.* --name \([^ ]*\) .*/\1/p')" != "$first" ] || fail "two runs got the same name: $first"
+  printf 'matrix=0.1.0\n' > .cbde
+  STUB_IMAGES="cbde:0.1.0" run "$CBDE" cabal --version
+  assert_match "$(last_docker)" ' --name cbde-0\.1\.0-[a-z0-9]{6} '
+}
+
+test_container_name_replaces_characters_docker_refuses() {
+  mkrepo p && cd p
+  STUB_IMAGE_VERSION= CBDE_IMAGE=localhost:5001/fork/cbde:dev+x STUB_IMAGES="localhost:5001/fork/cbde:dev+x" run "$CBDE" true
+  assert_rc "$rc" 0 "$out"
+  # The stub reports the tag as the version when STUB_IMAGE_VERSION is empty.
+  assert_match "$(last_docker)" ' --name cbde-dev-x-[a-z0-9]{6} '
+}
+
+test_own_name_in_docker_args_wins() {
+  mkrepo p && cd p
+  CBDE_DOCKER_ARGS='--name mine' STUB_IMAGES="cbde:latest" run "$CBDE" true
+  assert_rc "$rc" 0 "$out"
+  assert_contains "$(last_docker)" " --name mine "
+  assert_not_contains "$(last_docker)" "--name cbde-"
+}
+
+test_sync_is_forwarded_into_the_container() {
+  mkrepo p && cd p
+  STUB_IMAGES="cbde:latest" run "$CBDE" sync
+  assert_rc "$rc" 0 "$out"
+  assert_match "$(last_docker)" ' cbde:latest cbde sync$'
+}
+
 test_env_image_overrides_the_pin() {
   mkrepo p && cd p
   printf 'matrix=0.1.0\n' > .cbde
@@ -94,8 +153,51 @@ test_missing_image_says_how_to_get_it() {
   STUB_IMAGES= run "$CBDE" cabal --version
   assert_rc "$rc" 1; assert_contains "$out" "image cbde:latest not found"; assert_contains "$out" "cbde pull"
   printf 'matrix=0.1.0\n' > .cbde
-  STUB_IMAGES= run "$CBDE" cabal --version
+  STUB_IMAGES= CBDE_PULL=never run "$CBDE" cabal --version
+  assert_rc "$rc" 1
   assert_contains "$out" "cbde pull 0.1.0"; assert_contains "$out" "cbde build --matrix 0.1.0"
+  assert_not_contains "$(cat "$STUB_LOG")" "docker pull"
+  STUB_IMAGES= STUB_PULL_FAIL=1 run "$CBDE" cabal --version
+  assert_rc "$rc" 1
+  assert_contains "$out" "could not pull ghcr.io/input-output-hk/cbde:0.1.0"
+  assert_contains "$out" "cbde build --matrix 0.1.0"
+}
+
+test_a_pinned_project_pulls_its_missing_image_on_first_use() {
+  mkrepo p && cd p
+  printf 'matrix=0.1.0\n' > .cbde
+  CBDE_REGISTRY=localhost:5000/cbde STUB_IMAGES= run "$CBDE" cabal --version
+  assert_rc "$rc" 0 "$out"
+  assert_contains "$out" "cbde:0.1.0 is not here yet — pulling localhost:5000/cbde:0.1.0"
+  local log; log="$(cat "$STUB_LOG")"
+  assert_contains "$log" "docker pull localhost:5000/cbde:0.1.0"
+  assert_contains "$log" "docker tag localhost:5000/cbde:0.1.0 cbde:0.1.0"
+  assert_match "$(last_docker)" ' cbde:0\.1\.0 cabal --version$'
+  assert_eq "$(cat .cbde)" "matrix=0.1.0" "a run never rewrites the pin"
+  # Present now: the next run does not pull again.
+  : > "$STUB_LOG"
+  STUB_IMAGES="cbde:0.1.0" run "$CBDE" cabal --version
+  assert_not_contains "$(cat "$STUB_LOG")" "docker pull"
+}
+
+test_auto_pull_keeps_stdout_for_the_command() {
+  mkrepo p && cd p
+  printf 'matrix=0.1.0\n' > .cbde
+  local so
+  so="$(STUB_IMAGES= "$CBDE" cabal --version 2>/dev/null)" || true
+  assert_not_contains "$so" "pulling"
+  assert_not_contains "$so" "pull progress"
+  assert_not_contains "$so" "is now cbde:"
+}
+
+test_no_auto_pull_without_a_pin_or_with_an_explicit_image() {
+  mkrepo p && cd p
+  STUB_IMAGES= run "$CBDE" true
+  assert_rc "$rc" 1; assert_not_contains "$(cat "$STUB_LOG")" "docker pull"
+  printf 'matrix=0.1.0\n' > .cbde
+  CBDE_IMAGE=cbde:mine STUB_IMAGES= run "$CBDE" true
+  assert_rc "$rc" 1; assert_contains "$out" "image cbde:mine not found"
+  assert_not_contains "$(cat "$STUB_LOG")" "docker pull"
 }
 
 test_platform_docker_args_and_pins_are_passed_through() {

@@ -4,6 +4,9 @@
 . "$(dirname "$0")/harness.sh"
 INSTALL="$REPO/install.sh"
 export PATH="$STUBS:$PATH"
+# The try shell must never attach to the real terminal: run from one, it would
+# sit there invisibly waiting for input (and swallow Ctrl+C).
+export CBDE_TTY=/dev/null
 
 fake_launcher() { # a file that passes the shebang check and identifies itself
   printf '#!/usr/bin/env bash\necho "fake cbde $*"\n' > "$T/launcher"
@@ -142,6 +145,16 @@ test_try_falls_back_to_bash_for_unknown_shell() {
   assert_rc "$rc" 0
   assert_contains "$out" "$T/oddsh is not bash, zsh or fish; using bash"
   assert_contains "$out" "left the cbde try shell"
+}
+
+test_try_shell_reads_from_the_terminal_not_the_pipe() {
+  fake_launcher
+  # A stand-in terminal holding what a user would type.
+  printf 'echo typed-at-the-terminal\nexit\n' > "$T/tty"
+  printf '#!/bin/sh\n' > "$T/oddsh"; chmod +x "$T/oddsh"
+  run env HOME="$T/home" SHELL="$T/oddsh" CBDE_TTY="$T/tty" sh "$INSTALL" --try
+  assert_rc "$rc" 0
+  assert_contains "$out" "typed-at-the-terminal"
 }
 
 test_try_does_not_touch_disk_when_fetch_fails() {

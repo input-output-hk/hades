@@ -8,6 +8,9 @@ export CBDE_MATRIX_DIR="$FIXTURES/matrices"
 export CBDE_IMAGE_VERSION=0.2.0
 export CBDE_LEAN=leanprover/lean4:v4.24.0 CBDE_GHC=9.6.7 CBDE_CABAL=3.10.3.0 CBDE_PLUSTAN_GHC=9.6.7
 INNER="$REPO/cbde"
+# No project unless a test makes one (tests/project.test.sh covers .cbde /
+# .cbde.local in depth), whatever the machine has at /workspace.
+export CBDE_PROJECT=/nonexistent/cbde-project CBDE_ACTIVE_BIN=/nonexistent/cbde-active
 
 # A fake /nix volume: ghcup root with the pinned cabal but no GHC yet.
 fake_volume() {
@@ -15,7 +18,10 @@ fake_volume() {
   mkdir -p "$T/nix/cbde/.ghcup/bin" "$T/nix/cbde/.ghcup/ghc"
   printf 'vol /nix ext4 rw 0 0\n' > "$T/mounts"
   : > "$T/nix/cbde/.ghcup/bin/cabal-3.10.3.0"; chmod +x "$T/nix/cbde/.ghcup/bin/cabal-3.10.3.0"
+  export CBDE_ACTIVE_BIN="$T/active"
 }
+# A project for the switching verbs to record into.
+fake_project() { export CBDE_PROJECT="$T/proj"; mkdir -p "$T/proj"; : > "$T/proj/.cbde"; }
 
 test_matrix_list_stars_this_image() {
   run "$INNER" matrix list
@@ -65,9 +71,9 @@ test_matrix_reset_installs_what_is_missing_and_sets_the_rest() {
   assert_rc "$rc" 0 "$out"
   local log; log="$(cat "$STUB_LOG")"
   assert_contains "$log" "ghcup install ghc 9.6.7"
-  assert_contains "$log" "ghcup set ghc 9.6.7"
   assert_not_contains "$log" "ghcup install cabal"
-  assert_contains "$log" "ghcup set cabal 3.10.3.0"
+  assert_not_contains "$log" "ghcup set" "selection is links, never ghcup's global set"
+  assert_eq "$(readlink "$T/active/cabal")" "$T/nix/cbde/.ghcup/bin/cabal-3.10.3.0"
   assert_contains "$log" "elan toolchain install leanprover/lean4:v4.24.0"
   assert_contains "$log" "elan default leanprover/lean4:v4.24.0"
 }
@@ -97,7 +103,7 @@ test_matrix_reset_unpacks_lean_from_the_seed() {
 }
 
 test_ghc_switch_to_an_unseeded_version_downloads() {
-  fake_volume
+  fake_volume; fake_project
   export CBDE_SEED_DIR="$T/seed"; mkdir -p "$T/seed"
   run "$INNER" ghc 9.6.6
   assert_rc "$rc" 0 "$out"
@@ -125,11 +131,11 @@ test_missing_matrix_file_for_this_image_is_reported() {
 }
 
 test_ghc_switch_warns_about_plustan() {
-  fake_volume; mkdir -p "$T/nix/cbde/.ghcup/ghc/9.6.6"
+  fake_volume; fake_project; mkdir -p "$T/nix/cbde/.ghcup/ghc/9.6.6"
   run "$INNER" ghc 9.6.6
   assert_rc "$rc" 0 "$out"
   assert_contains "$out" "plustan was built against GHC 9.6.7"
-  assert_contains "$(cat "$STUB_LOG")" "ghcup set ghc 9.6.6"
+  assert_eq "$(cat "$T/proj/.cbde")" "ghc=9.6.6"
 }
 
 test_help_and_unknown_verb() {

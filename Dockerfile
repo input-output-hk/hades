@@ -436,6 +436,19 @@ COPY --from=blaster-builder /opt/blaster /opt/blaster
 RUN ldconfig && mkdir -p /nix/cbde/elan && chown cbde:cbde /nix/cbde/elan && ln -s /nix/cbde/elan /root/.elan
 ENV PATH=/root/.elan/bin:$PATH
 
+# The project's toolchain selection: symlinks into the volume, rebuilt by the
+# provisioner on every start from the matrix + the project's .cbde and
+# .cbde.local. It lives in the container, not the volume, so containers on
+# different projects never share it; it shadows ghcup's global selection.
+ENV CBDE_ACTIVE_BIN=/root/.local/share/cbde/bin
+ENV PATH=/root/.local/share/cbde/bin:$PATH
+
+# A UTF-8 locale. Without it processes run in "C", and every GHC-compiled
+# program writes stdout as ASCII: stan's test suite died on its first 'ⓘ'
+# with "commitAndReleaseBuffer: invalid argument (cannot encode character)".
+# C.UTF-8 ships with the base image; no locale package needed.
+ENV LANG=C.UTF-8
+
 # Single-volume layout: the user mounts ONE named volume at /nix and Docker
 # initializes the empty volume from the image content at that path
 # (named-volume copy-up). All big mutable state is in there:
@@ -462,11 +475,14 @@ ENTRYPOINT ["/usr/local/bin/cbde-entrypoint"]
 # Self-describing Dev Container metadata: when a project references this image
 # (devcontainer.json "image"), VS Code merges these fragments — extensions and
 # settings get installed container-side automatically. onCreateCommand is a
-# belt-and-braces provision in case the tooling replaces our ENTRYPOINT.
+# belt-and-braces provision in case the tooling replaces our ENTRYPOINT (it
+# usually does); postStartCommand re-reads the project's .cbde/.cbde.local on
+# every start and relinks, a few stat calls once the volume is warm.
 LABEL devcontainer.metadata='[{ \
   "remoteUser": "cbde", \
   "updateRemoteUserUID": true, \
   "onCreateCommand": "cbde-provision", \
+  "postStartCommand": "cbde-provision", \
   "customizations": { \
     "vscode": { \
       "extensions": [ \

@@ -73,8 +73,8 @@ and `cbde registry status` are the sources.
   d7df730 feat: local dev registry, per-user config, live matrix list
   a82b112 feat: compatibility matrices, image-seeded toolchains, unit tests
   1d16fd9 feat(macos): native multi-arch image, Rosetta only for nix x86_64
-- Tests: 117 across six suites (`inner`, `install`, `launcher`, `matrix`, `repo`,
-  `seed`). On this Mac two fail for reasons unrelated to the launcher
+- Tests: 142 across seven suites (`inner`, `install`, `launcher`, `matrix`,
+  `project`, `repo`, `seed`); all pass on the Linux box. On the Mac two fail for reasons unrelated to the launcher
   (`matrix: test_validate_rejects_malformed_files` — `[!A-Z_]` accepts a
   lowercase key under the UTF-8 locale; `seed: test_index_corrupt_seed_falls_back_unless_strict`
   — a corrupt `.tar.xz` is not caught by the seed path); CI on Linux is the
@@ -110,8 +110,21 @@ and `cbde registry status` are the sources.
 
 ## Open decisions (as of 2026-09-22)
 
-- Matrix should win on every start (provisioner `set`s pinned versions unless
-  a "custom" marker exists) so switching images does not report custom.
+- **Per-project toolchains: built 2026-09-28, uncommitted, not in a real
+  image yet** (checked on a throwaway `cbde:pp-test` = `cbde:latest` + new
+  scripts; a full `cbde build` rebuilds plustan since the toolchain stage copies
+  the provisioner and lib). Volume = cache of installed versions; selection is
+  image matrix < `.cbde` (team) < `.cbde.local` (personal, wins), keys `ghc`/`cabal`/`hls` (+ `matrix`), linked into
+  `$CBDE_ACTIVE_BIN` (`/root/.local/share/cbde/bin`, container-local, first
+  on PATH) by the provisioner on every start (devcontainer: `postStartCommand`).
+  `cbde ghc X` writes the project's `.cbde`; `--local` writes `.cbde.local`
+  (+ gitignore), otherwise cbde never creates or edits it (Bogdan, 2026-10-01).
+  No `--team`/`--global`: outside a project the links are the matrix and a
+  switch is refused. `matrix reset` clears `.cbde`'s ghc/cabal/hls, only
+  reports `.cbde.local`. `cbde sync` installs + relinks.
+  Verdict verified / declared / custom. Lean: elan's `lean-toolchain`.
+  Known gap: `with-compiler: ghc-X` in cabal.project bypasses the links
+  (versioned names fall through to `.ghcup/bin`); no warning yet.
 - The volume-stamp warning ("initialized by CBDE x, image is y") is noise
   with shared volumes; downgrade or drop.
 - Nix is not pinned in the matrix; its store path is shared via the volume.

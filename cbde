@@ -16,6 +16,12 @@ set -uo pipefail
 GHCUP_ROOT="${GHCUP_INSTALL_BASE_PREFIX:-/nix/cbde}/.ghcup"
 GHCUP_BINDIR="$GHCUP_ROOT/bin"
 
+# The project mounted into this container (see project_root_here), or empty.
+# Inside a project, switching a version writes the project's .cbde (or, with
+# --local, .cbde.local) and relinks this container only. Outside a project
+# the toolchain is the matrix's and does not switch.
+PROJECT="$(project_root_here)"
+
 ok()   { printf '  \033[32m✓\033[0m %s\n' "$*"; }
 bad()  { printf '  \033[31m✗\033[0m %s\n' "$*"; }
 note() { printf '  \033[33m!\033[0m %s\n' "$*"; }
@@ -47,11 +53,13 @@ cbde — manage the toolchain versions in this container
   cbde ghc [VERSION]      show, or install+switch to, a GHC version
   cbde cabal [VERSION]    show, or install+switch to, a cabal version
   cbde hls [VERSION]      install the language server (not shipped by default)
+      --local             ... just for you: .cbde.local instead of .cbde
+  cbde sync               install what this project selects, and relink
   cbde lean [TOOLCHAIN]   show, or install+switch to, a Lean toolchain
   cbde list               what is installed, and what is active
   cbde matrix             is the active toolchain the verified set of this image?
   cbde matrix list        every compatibility matrix this image knows about
-  cbde matrix reset       back to the verified set (installs what is missing)
+  cbde matrix reset       back to the verified set (drops .cbde's picks)
   cbde update             refresh the list of installable versions
   cbde devcontainer       write .devcontainer/devcontainer.json into this project
   cbde doctor             check this container and volume for problems
@@ -66,8 +74,15 @@ Examples
 Anything installed here lands in the volume mounted at /nix, so it is
 downloaded once and reused by every later container. Power users: `ghcup tui`.
 
-Switching a version moves you off the image's compatibility matrix onto a
-custom one. Nothing stops you; `cbde matrix` and `cbde doctor` say so.
+In a project, a switch is recorded in its .cbde (commit it: it is the
+project's choice) or, with --local, in .cbde.local (yours, gitignored). Both
+are read on every start, on top of the image's matrix, .cbde.local winning,
+and only this container is relinked. Containers on other projects sharing
+the volume keep their own versions; outside a project it is the matrix.
+
+Switching moves you off the image's compatibility matrix. Nothing stops you;
+`cbde matrix` and `cbde doctor` say whether the difference is declared by the
+project or not.
 USAGE
 }
 
@@ -78,38 +93,146 @@ require_volume() {
   return 1
 }
 
-cmd_switch() { # $1 = tool (ghc|cabal), $2 = version (may be empty)
-  local tool="$1" version="${2:-}"
-  if [ -z "$version" ]; then
-    case "$tool" in
-      ghc)   printf 'active GHC:   %s\n' "$(active_ghc || echo '(none installed)')" ;;
-      cabal) printf 'active cabal: %s\n' "$(active_cabal || echo '(none installed)')" ;;
+tool_installed() { # TOOL VERSION
+  case "$1" in
+    ghc)   [ -d "$GHCUP_ROOT/ghc/$2" ] ;;
+    cabal) [ -x "$GHCUP_BINDIR/cabal-$2" ] ;;
+    hls)   [ -x "$GHCUP_BINDIR/haskell-language-server-wrapper-$2" ] ;;
+  esac
+}
+
+# Run under the volume lock; re-checks, since another container may have
+# installed the same version while we waited.
+install_tool() { # TOOL VERSION
+  tool_installed "$1" "$2" && return 0
+  printf 'cbde: installing %s %s (this can take a few minutes)\n' "$1" "$2"
+  ghcup_install "$1" "$2"
+}
+
+ensure_installed() { # TOOL VERSION
+  tool_installed "$1" "$2" && return 0
+  require_volume || return 1
+  with_volume_lock install_tool "$1" "$2"
+}
+
+# .cbde.local is personal: make sure git in the project ignores it.
+ensure_local_ignored() {
+  local root="$1" gi="$1/.gitignore"
+  [ -e "$root/.git" ] || return 0
+  if command -v git >/dev/null 2>&1; then
+    git -C "$root" check-ignore -q .cbde.local 2>/dev/null && return 0
+  else
+    grep -qx '\.cbde\.local' "$gi" 2>/dev/null && return 0
+  fi
+  [ -s "$gi" ] && [ -n "$(tail -c 1 "$gi")" ] && printf '\n' >> "$gi"
+  printf '.cbde.local\n' >> "$gi"
+  note "added .cbde.local to .gitignore: it holds your personal toolchain choices"
+}
+
+label_of() { case "$1" in ghc) printf GHC ;; hls) printf HLS ;; *) printf '%s' "$1" ;; esac; }
+
+active_version_of() {
+  case "$1" in ghc) active_ghc ;; cabal) active_cabal ;; hls) active_hls ;; esac
+}
+
+show_tool() { # TOOL
+  local tool="$1" src
+  printf 'active %-6s %s' "$(label_of "$tool"):" "$(active_version_of "$tool" || true)"
+  [ -n "$(active_version_of "$tool" || true)" ] || printf '(none)'
+  src="$(selected_source "$PROJECT" "$tool")"
+  if [ -z "$PROJECT" ]; then
+    printf '   (the matrix'"'"'s: no project at %s)\n' "$CBDE_PROJECT"
+  elif [ "$src" = matrix ]; then printf '   (the matrix'"'"'s)\n'
+  else printf '   (from %s; matrix: %s)\n' "$src" "$(matrix_default "$tool" | sed 's/^$/not pinned/')"; fi
+  case "$tool" in
+    ghc)   printf 'installed:   %s\n' "$(installed_ghcs | tr '\n' ' ')" ;;
+    cabal) printf 'installed:   %s\n' "$(installed_of 'cabal-' | tr '\n' ' ')" ;;
+    hls)   printf 'installed:   %s\n' "$(installed_of 'haskell-language-server-wrapper-' | tr '\n' ' ')" ;;
+  esac
+  printf 'switch with: cbde %s <version>   [--local]\n' "$tool"
+}
+
+# cmd_switch TOOL [VERSION] [--local]
+# Records VERSION in the project's .cbde (--local: .cbde.local) and relinks
+# this container. A version equal to what the layer below gives is removed
+# instead of recorded, so switching back leaves no redundant pin. There is
+# no project-less switch: outside a project the toolchain is the matrix.
+cmd_switch() {
+  local tool="$1" version= file=.cbde a below other
+  shift
+  for a in "$@"; do
+    case "$a" in
+      --local) file=.cbde.local ;;
+      -*)      bad "unknown flag: $a"; return 2 ;;
+      *)       version="$a" ;;
     esac
-    printf 'installed:    %s\n' "$( { [ "$tool" = ghc ] && installed_ghcs || installed_of 'cabal-'; } | tr '\n' ' ')"
-    printf "switch with:  cbde %s <version>\n" "$tool"
-    return 0
+  done
+  if [ -z "$version" ]; then show_tool "$tool"; return 0; fi
+  project_version_ok "$version" || { bad "not a version: $version"; return 2; }
+  if [ -z "$PROJECT" ]; then
+    bad "no project at $CBDE_PROJECT: outside a project the toolchain is matrix $(image_matrix)'s."
+    note "run this in a project (cbde mounts it) to record $(label_of "$tool") $version in its .cbde"
+    return 1
   fi
 
   [ "$tool" = ghc ] && warn_plustan_mismatch "$version"
+  ensure_installed "$tool" "$version" || return 1
 
-  local present=
-  if [ "$tool" = ghc ]; then
-    [ -d "$GHCUP_ROOT/ghc/$version" ] && present=1
+  if [ "$file" = .cbde.local ]; then
+    below="$(pfile_get "$PROJECT" .cbde "$tool")"
+    [ -n "$below" ] || below="$(matrix_default "$tool")"
   else
-    [ -x "$GHCUP_BINDIR/cabal-$version" ] && present=1
+    below="$(matrix_default "$tool")"
   fi
+  if [ "$version" = "$below" ]; then
+    pfile_set "$PROJECT" "$file" "$tool" ""
+  else
+    pfile_set "$PROJECT" "$file" "$tool" "$version"
+    [ "$file" = .cbde.local ] && ensure_local_ignored "$PROJECT"
+  fi
+  active_link "$PROJECT" || { bad "could not relink $CBDE_ACTIVE_BIN"; return 1; }
+  if [ "$file" = .cbde ]; then
+    if [ "$version" = "$below" ]; then
+      ok "$(label_of "$tool") $version, the matrix's, is this project's again (.cbde)"
+    else
+      ok "$(label_of "$tool") $version is now this project's choice (.cbde — commit it)"
+    fi
+    other="$(pfile_get "$PROJECT" .cbde.local "$tool")"
+    [ -z "$other" ] || note "your .cbde.local still selects $(label_of "$tool") $other for you"
+  else
+    ok "$(label_of "$tool") $version is now active for you in this project$( [ "$version" = "$below" ] || printf ' (.cbde.local)')"
+  fi
+}
 
-  if [ -z "$present" ]; then
-    require_volume || return 1
-    printf 'cbde: installing %s %s (this can take a few minutes)\n' "$tool" "$version"
-    ghcup_install "$tool" "$version" || return 1
-  fi
-  ghcup set "$tool" "$version" || return 1
-  ok "$tool $version is now active"
+# `cbde sync`: install whatever this project selects and relink, e.g. after
+# a teammate changed .cbde, or when a start had no network.
+cmd_sync() {
+  local k v rc=0
+  [ -n "$PROJECT" ] || note "no project at $CBDE_PROJECT: linking matrix $(image_matrix)'s versions"
+  for k in $PROJECT_KEYS; do
+    v="$(selected_version "$PROJECT" "$k")"
+    [ -z "$v" ] || ensure_installed "$k" "$v" || rc=1
+  done
+  active_link "$PROJECT" || rc=1
+  for k in $PROJECT_KEYS; do
+    v="$(selected_version "$PROJECT" "$k")"
+    [ -z "$v" ] || ok "$(printf '%-6s %s (%s)' "$(label_of "$k")" "$v" "$(selected_source "$PROJECT" "$k")")"
+  done
+  return "$rc"
 }
 
 cmd_hls() {
-  local version="${1:-}"
+  local version= a
+  for a in "$@"; do case "$a" in -*) ;; *) version="$a" ;; esac; done
+  # A named version is a selection like any other. Without one, the newest HLS
+  # is installed as ghcup's fallback, which applies wherever nothing pins hls.
+  if [ -n "$version" ]; then
+    cmd_switch hls "$@" || return 1
+    local g; g="$(active_ghc)"
+    [ -z "$g" ] || [ -e "$CBDE_ACTIVE_BIN/haskell-language-server-$g" ] \
+      || note "HLS $version ships no server for GHC $g; pick an HLS release that does."
+    return 0
+  fi
   require_volume || return 1
   local ghc; ghc="$(active_ghc)"
   if [ -z "$ghc" ]; then
@@ -254,30 +377,53 @@ matrix_show() {
     "$(matrix_get "$f" AIKEN_VERSION)" "$(matrix_get "$f" Z3_TAG)" "$(matrix_get "$f" GHCUP_VERSION)"
   printf '  in the volume, switchable:\n'
   [ "$name" = "$own" ] || { matrix_status "$f" | awk -F'\t' '{ printf "    %-6s %s\n", $1, $2 }'; return 0; }
-  matrix_status "$f" | while IFS="$(printf '\t')" read -r comp want have state; do
+  matrix_status "$f" | while IFS="$(printf '\t')" read -r comp want have state src; do
     case "$state" in
       ok)       ok   "$(printf '%-6s %s' "$comp" "$want")" ;;
+      declared) note "$(printf '%-6s pinned %s, active %s (declared in %s)' "$comp" "$want" "$have" "$src")" ;;
       optional) printf '    %-6s not pinned%s\n' "$comp" "$([ "$have" != '(none)' ] && printf ' (installed: %s)' "$have")" ;;
-      missing)  bad  "$(printf '%-6s pinned %s, not installed' "$comp" "$want")" ;;
+      missing)
+        if [ -n "$src" ]; then
+          bad "$(printf '%-6s %s selects %s, not installed (run: cbde sync)' "$comp" "$src" \
+                 "$(selected_version "$PROJECT" "$(printf '%s' "$comp" | sed 's/GHC/ghc/; s/HLS/hls/')")")"
+        else
+          bad "$(printf '%-6s pinned %s, not installed' "$comp" "$want")"
+        fi ;;
       off)      note "$(printf '%-6s pinned %s, active %s' "$comp" "$want" "$have")" ;;
     esac
   done
   printf '\n'
-  if matrix_status "$f" >/dev/null; then
-    ok "verified: the active toolchain is exactly matrix $name"
-  else
-    note "custom: the active toolchain differs from matrix $name — fine if deliberate;"
-    note "back to the verified set with: cbde matrix reset"
-  fi
+  case "$(matrix_verdict "$f")" in
+    verified) ok "verified: the active toolchain is exactly matrix $name" ;;
+    declared)
+      note "declared: differs from matrix $name only where this project says so"
+      note "(.cbde / .cbde.local) — a choice, but not the verified set" ;;
+    *)
+      note "custom: the active toolchain differs from matrix $name — fine if deliberate;"
+      note "back to the verified set with: cbde matrix reset" ;;
+  esac
 }
 
-# Re-apply the image's own pins, installing whatever the volume lacks. Uses the
-# same switch paths as the user-facing verbs, so warnings come out the same.
+# Re-apply the image's own pins, installing whatever the volume lacks. In a
+# project that means dropping .cbde's ghc/cabal/hls picks (the file cbde
+# writes); .cbde.local is the programmer's own and is only reported. Outside a
+# project the links already are the matrix; this re-installs and relinks.
 matrix_apply() {
-  local f="$1" v rc=0
-  cmd_switch ghc   "$(matrix_get "$f" CBDE_GHC)"   || rc=1
-  cmd_switch cabal "$(matrix_get "$f" CBDE_CABAL)" || rc=1
-  v="$(matrix_get "$f" CBDE_HLS)";  [ -z "$v" ] || cmd_hls "$v"   || rc=1
+  local f="$1" v k rc=0
+  if [ -n "$PROJECT" ]; then
+    for k in $PROJECT_KEYS; do
+      v="$(pfile_get "$PROJECT" .cbde "$k")"
+      [ -z "$v" ] || { pfile_set "$PROJECT" .cbde "$k" ""; note "dropped $k=$v from .cbde"; }
+    done
+  fi
+  for k in $PROJECT_KEYS; do
+    v="$(selected_version "$PROJECT" "$k")"
+    [ -z "$v" ] || ensure_installed "$k" "$v" || rc=1
+  done
+  active_link "$PROJECT" || rc=1
+  if [ -n "$PROJECT" ] && [ -n "$(project_summary "$PROJECT")" ]; then
+    note "your .cbde.local still selects: $(project_summary "$PROJECT" | tr '\n' ',' | sed 's/,$//; s/,/, /g')"
+  fi
   v="$(matrix_get "$f" CBDE_LEAN)"; [ -z "$v" ] || cmd_lean "$v"  || rc=1
   matrix_show "$f"
   return "$rc"
@@ -314,6 +460,12 @@ cmd_list() {
   printf '  cabal     installed: %s\n' "$(installed_of 'cabal-' | tr '\n' ' ')"
   printf '            active:    %s\n' "$(active_cabal || echo '-')"
   printf '  HLS       installed: %s\n' "$(installed_of 'haskell-language-server-wrapper-' | tr '\n' ' ')"
+  if [ -n "$PROJECT" ]; then
+    printf '  project   %s selects: %s\n' "$PROJECT" \
+      "$(for k in $PROJECT_KEYS; do v="$(selected_version "$PROJECT" "$k")"; [ -z "$v" ] || printf '%s %s (%s)  ' "$k" "$v" "$(selected_source "$PROJECT" "$k")"; done)"
+  else
+    printf '  project   none at %s — the matrix applies\n' "$CBDE_PROJECT"
+  fi
   hdr "Lean toolchain (in the /nix volume)"
   if command -v elan >/dev/null 2>&1; then
     elan toolchain list 2>&1 | sed 's/^/  /'
@@ -471,8 +623,11 @@ cmd_doctor() {
     bad "CBDE_IMAGE_VERSION is not set — this image does not know which matrix it is"
     fail=1
   elif mf="$(matrix_file "$(image_matrix)" 2>/dev/null)"; then
-    if matrix_status "$mf" >/dev/null; then
+    if [ "$(matrix_verdict "$mf")" = verified ]; then
       ok "verified set $(image_matrix): the active toolchain is the one this image was tested with"
+    elif [ "$(matrix_verdict "$mf")" = declared ]; then
+      note "declared: this project selects its own versions on top of matrix $(image_matrix)"
+      matrix_status "$mf" | awk -F'\t' '$4 == "declared" { printf "      %-6s pinned %-28s active %s (%s)\n", $1, $2, $3, $5 }'
     else
       note "custom: the active toolchain differs from matrix $(image_matrix)"
       matrix_status "$mf" | awk -F'\t' '$4 == "off" || $4 == "missing" { printf "      %-6s pinned %-28s active %s\n", $1, $2, $3 }'
@@ -485,7 +640,7 @@ cmd_doctor() {
 
   hdr "IDE support"
   if [ -n "$(active_hls)" ]; then
-    if [ -n "$ghc" ] && [ -x "$GHCUP_BINDIR/haskell-language-server-$ghc" ]; then
+    if [ -n "$ghc" ] && command -v "haskell-language-server-$ghc" >/dev/null 2>&1; then
       ok "HLS $(active_hls) has a server for GHC $ghc"
     else
       bad "HLS $(active_hls) has no server for GHC $ghc"
@@ -561,9 +716,10 @@ cmd_doctor() {
 }
 
 case "${1:-help}" in
-  ghc)    cmd_switch ghc "${2:-}" ;;
-  cabal)  cmd_switch cabal "${2:-}" ;;
-  hls)    cmd_hls "${2:-}" ;;
+  ghc)    shift; cmd_switch ghc "$@" ;;
+  cabal)  shift; cmd_switch cabal "$@" ;;
+  hls)    shift; cmd_hls "$@" ;;
+  sync)   cmd_sync ;;
   lean)   cmd_lean "${2:-}" ;;
   list|ls) cmd_list ;;
   matrix) shift; cmd_matrix "$@" ;;

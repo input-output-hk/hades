@@ -56,12 +56,23 @@ test_dockerfile_builds_and_ships_the_toolchain_seed() {
   assert_contains "$stage" "COPY cbde-provision /usr/local/bin/"
 }
 
+test_final_image_runs_under_a_utf8_locale() {
+  # GHC programs encode stdout by the locale; under "C" a single non-ASCII
+  # character kills them (stan's test suite, on its 'ⓘ').
+  local stage; stage="$(sed -n '/^FROM base AS final/,$p' "$REPO/Dockerfile")"
+  assert_contains "$stage" "ENV LANG=C.UTF-8"
+}
+
 test_devcontainer_template_targets_latest_and_is_stamped() {
   local dc="$REPO/templates/devcontainer.json"
   assert_no_file "$REPO/.devcontainer" "the checkout is the tool, not a project: no live devcontainer here"
   assert_contains "$(cat "$dc")" '"image": "cbde:latest"'
   assert_contains "$(cat "$dc")" '"//cbde-template": "dev"'
   assert_contains "$(cat "$dc")" 'source=cbde-data,target=/nix,type=volume'
+  # Devcontainers replace the entrypoint: the project's .cbde / .cbde.local are
+  # only re-read on start if postStartCommand provisions (and so relinks).
+  assert_contains "$(cat "$dc")" '"postStartCommand": "cbde-provision"'
+  assert_contains "$(cat "$REPO/Dockerfile")" '"postStartCommand": "cbde-provision"'
 }
 
 test_workflow_gates_the_build_on_the_tests() {
