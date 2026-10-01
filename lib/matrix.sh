@@ -134,29 +134,213 @@ active_of() {
 }
 
 # FILE -> one tab-separated line per switchable component:
-#   component <TAB> pinned <TAB> active <TAB> ok|off|missing|optional
-# Returns 0 when everything pinned is active (verified), 1 otherwise (custom).
+#   component <TAB> pinned <TAB> active <TAB> state [<TAB> source]
+# state is ok|off|missing|optional|declared; a declared or missing line adds
+# the project file that selects the version (.cbde or .cbde.local), if any.
+# Returns 0 when everything pinned is active (verified), 2 when every
+# difference is one the project declares, 1 otherwise (custom).
 # A component the matrix leaves empty (HLS, usually) is optional: whatever is
 # installed is fine.
 matrix_status() {
-  local f="$1" rc=0 pair comp key want have state
+  local f="$1" rc=0 declared=0 pair comp key want have state o src root
+  root="$(project_root_here)"
   for pair in $MATRIX_SWITCHABLE; do
     comp="${pair%%:*}"; key="${pair#*:}"
     want="$(matrix_get "$f" "$key")"
     have="$(active_of "$comp")"
+    o=; src=
+    case "$comp" in
+      GHC)   o="$(project_override "$root" ghc)" ;;
+      cabal) o="$(project_override "$root" cabal)" ;;
+      HLS)   o="$(project_override "$root" hls)" ;;
+    esac
     if   [ -z "$want" ];         then state=optional
-    elif [ -z "$have" ];         then state=missing
+    elif [ -z "$have" ];         then state=missing; [ -z "$o" ] || src="${o#* }"
     elif [ "$want" = "$have" ];  then state=ok
+    elif [ -n "$o" ] && [ "${o%% *}" = "$have" ]; then state=declared; src="${o#* }"
     else                              state=off
     fi
-    printf '%s\t%s\t%s\t%s\n' "$comp" "${want:-(not pinned)}" "${have:-(none)}" "$state"
-    case "$state" in ok|optional) ;; *) rc=1 ;; esac
+    printf '%s\t%s\t%s\t%s%s\n' "$comp" "${want:-(not pinned)}" "${have:-(none)}" "$state" "${src:+$(printf '\t')$src}"
+    case "$state" in ok|optional) ;; declared) declared=1 ;; *) rc=1 ;; esac
   done
+  [ "$rc" = 0 ] && [ "$declared" = 1 ] && rc=2
   return "$rc"
 }
 
-# FILE -> "verified" or "custom".
-matrix_verdict() { matrix_status "$1" >/dev/null && printf 'verified' || printf 'custom'; }
+# FILE -> "verified", "declared" (differs only where the project says so) or
+# "custom".
+matrix_verdict() {
+  local rc=0
+  matrix_status "$1" >/dev/null || rc=$?
+  case "$rc" in 0) printf 'verified' ;; 2) printf 'declared' ;; *) printf 'custom' ;; esac
+}
+
+# ---------------------------------------------------------------------------
+# Per-project toolchain selection
+# ---------------------------------------------------------------------------
+# The volume is shared by every container, so it only says what is installed.
+# What is active is decided per container, on every start: the image's matrix,
+# overridden by the project's .cbde (committed, the team's choice), overridden
+# by .cbde.local (gitignored, personal: written by hand or with --local). The
+# result is a directory of symlinks into the volume, first on PATH but outside
+# /nix, so two containers working on two projects never see each other's
+# choice. Outside a project it is the
+# matrix alone: the selection is the same everywhere unless a project's files
+# say otherwise, and ghcup's global `set` in the volume is only a fallback for
+# names nobody linked (another GHC's ghc-X.Y.Z, an unpinned HLS).
+#
+#   # .cbde                     # .cbde.local
+#   matrix=0.2.0                ghc=9.6.6
+#   cabal=3.12.1.0
+#
+# Keys: ghc, cabal, hls (matrix= is read by the host launcher). Lean needs
+# none of this: elan already honours a project's lean-toolchain file.
+CBDE_PROJECT="${CBDE_PROJECT:-/workspace}"
+CBDE_ACTIVE_BIN="${CBDE_ACTIVE_BIN:-/root/.local/share/cbde/bin}"
+PROJECT_FILES=".cbde.local .cbde"   # the first that sets a key wins
+PROJECT_KEYS="ghc cabal hls"
+
+# The project this container works on, or nothing: $CBDE_PROJECT when it is
+# a mount (the launcher and the devcontainer mount the project there) or has
+# a .cbde / .cbde.local. The image's own empty /workspace is neither.
+project_root_here() {
+  local d="$CBDE_PROJECT"
+  [ -d "$d" ] || return 0
+  if [ -f "$d/.cbde" ] || [ -f "$d/.cbde.local" ] \
+     || awk -v m="$d" '$2 == m { f = 1 } END { exit !f }' "${CBDE_MOUNTS_FILE:-/proc/self/mounts}" 2>/dev/null; then
+    printf '%s\n' "$d"
+  fi
+  return 0
+}
+
+project_version_ok() { case "$1" in ''|*[!A-Za-z0-9._~-]*) return 1 ;; *) return 0 ;; esac; }
+
+# ROOT FILE KEY -> the value of `key=value` in ROOT/FILE, or nothing.
+pfile_get() {
+  [ -f "$1/$2" ] || return 0
+  sed -n "s/^[[:space:]]*$3[[:space:]]*=[[:space:]]*//p" "$1/$2" | head -n 1 | tr -d '[:space:]'
+}
+
+# ROOT FILE KEY VALUE: set (or, with an empty VALUE, remove) one key, keeping
+# every other line. A file left with nothing but comments is removed.
+pfile_set() {
+  local f="$1/$2" key="$3" val="${4:-}"
+  if [ -f "$f" ]; then
+    grep -v "^[[:space:]]*$key[[:space:]]*=" "$f" > "$f.tmp" || true
+  else
+    printf '# CBDE project settings (see: cbde help)\n' > "$f.tmp"
+  fi
+  [ -z "$val" ] || printf '%s=%s\n' "$key" "$val" >> "$f.tmp"
+  if grep -q '^[[:space:]]*[^#[:space:]]' "$f.tmp"; then mv "$f.tmp" "$f"; else rm -f "$f.tmp" "$f"; fi
+}
+
+# ROOT KEY -> "<version> <file>" for the file that selects KEY, or nothing.
+project_override() {
+  local root="$1" key="$2" f v
+  [ -n "$root" ] || return 0
+  for f in $PROJECT_FILES; do
+    v="$(pfile_get "$root" "$f" "$key")"
+    [ -n "$v" ] || continue
+    if ! project_version_ok "$v"; then
+      printf 'cbde: WARNING: ignoring %s=%s in %s: not a version\n' "$key" "$v" "$f" >&2
+      continue
+    fi
+    printf '%s %s\n' "$v" "$f"
+    return 0
+  done
+  return 0
+}
+
+matrix_default() {
+  case "$1" in
+    ghc)   printf '%s\n' "${CBDE_GHC:-}" ;;
+    cabal) printf '%s\n' "${CBDE_CABAL:-}" ;;
+    hls)   printf '%s\n' "${CBDE_HLS:-}" ;;
+  esac
+}
+
+# ROOT KEY -> the version the project runs: its override, else the matrix's.
+selected_version() {
+  local o; o="$(project_override "$1" "$2")"
+  if [ -n "$o" ]; then printf '%s\n' "${o%% *}"; else matrix_default "$2"; fi
+}
+
+# ROOT KEY -> where selected_version got it: .cbde.local, .cbde or matrix.
+selected_source() {
+  local o; o="$(project_override "$1" "$2")"
+  if [ -n "$o" ]; then printf '%s\n' "${o#* }"; else printf 'matrix\n'; fi
+}
+
+# DIR NAME TOOL VERSION: a stand-in that says what is missing, so a version
+# the volume lacks fails loudly instead of falling through to the global one.
+missing_stub() {
+  cat > "$1/$2" <<EOS
+#!/bin/sh
+echo "cbde: this project selects $3 $4, which is not installed in the volume." >&2
+echo "cbde: install it with: cbde sync" >&2
+exit 127
+EOS
+  chmod 755 "$1/$2"
+}
+
+# ROOT -> rebuilds $CBDE_ACTIVE_BIN for that project; an empty ROOT (no
+# project) links the matrix's versions. Built beside the target and renamed.
+active_link() {
+  local root="$1" g="${GHCUP_INSTALL_BASE_PREFIX:-/nix/cbde}/.ghcup" dir="$CBDE_ACTIVE_BIN"
+  local new="$CBDE_ACTIVE_BIN.new" ghc cabal hls f n
+  rm -rf "$new"
+  mkdir -p "$new" || return 1
+  ghc="$(selected_version "$root" ghc)"
+  cabal="$(selected_version "$root" cabal)"
+  hls="$(selected_version "$root" hls)"
+  if [ -n "$ghc" ]; then
+    if [ -d "$g/ghc/$ghc/bin" ]; then
+      for f in "$g/ghc/$ghc/bin"/*; do [ -e "$f" ] && ln -s "$f" "$new/${f##*/}"; done
+    else
+      missing_stub "$new" ghc GHC "$ghc"
+    fi
+  fi
+  if [ -n "$cabal" ]; then
+    if [ -x "$g/bin/cabal-$cabal" ]; then ln -s "$g/bin/cabal-$cabal" "$new/cabal"
+    else missing_stub "$new" cabal cabal "$cabal"; fi
+  fi
+  # ghcup names HLS binaries haskell-language-server-<ghc>~<hls>; the wrapper
+  # looks for haskell-language-server-<ghc> on PATH.
+  if [ -n "$hls" ]; then
+    if [ -x "$g/bin/haskell-language-server-wrapper-$hls" ]; then
+      ln -s "$g/bin/haskell-language-server-wrapper-$hls" "$new/haskell-language-server-wrapper"
+      for f in "$g/bin/haskell-language-server-"*"~$hls"; do
+        [ -e "$f" ] || continue
+        n="${f##*/}"; ln -s "$f" "$new/${n%~*}"
+      done
+    else
+      missing_stub "$new" haskell-language-server-wrapper HLS "$hls"
+    fi
+  fi
+  rm -rf "$dir" && mv "$new" "$dir"
+}
+
+# ROOT -> one line per key the project changes, e.g. "GHC 9.6.6 (.cbde.local)".
+project_summary() {
+  local k o
+  for k in $PROJECT_KEYS; do
+    o="$(project_override "$1" "$k")"
+    [ -z "$o" ] || printf '%s %s (%s)\n' "$k" "${o%% *}" "${o#* }"
+  done
+  return 0
+}
+
+# CMD...: run with the volume's provisioning lock held, so two containers on
+# one volume never install into the same ghcup root at once. The provisioner
+# holds the same lock for the whole of its run.
+with_volume_lock() {
+  local lock="${GHCUP_INSTALL_BASE_PREFIX:-/nix/cbde}/.provision.lock"
+  if command -v flock >/dev/null 2>&1 && : 2>/dev/null >>"$lock"; then
+    ( exec 9>>"$lock"; flock 9; "$@" )
+  else
+    "$@"
+  fi
+}
 
 # ---------------------------------------------------------------------------
 # Installing the matrix's toolchain: from the image when possible

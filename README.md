@@ -107,8 +107,10 @@ docker run --rm -it \
 ```
 
 What the wrapper adds is only convenience: it picks the directory to mount,
-attaches the volume, passes `-it` only when you actually have a terminal, and
-forwards `CBDE_*` variables.
+attaches the volume, passes `-it` only when you actually have a terminal,
+forwards `CBDE_*` variables, and names the container after its matrix plus a
+random suffix (`--name cbde-0.2.0-k3x9q2`), so `docker ps` tells parallel
+runs apart. A `--name` in `CBDE_DOCKER_ARGS` replaces it.
 
 **Which directory it mounts** is the one rule worth reading twice. If you are
 inside a git repository it mounts the **repository root**, not your current
@@ -442,8 +444,10 @@ container.
 
 ```bash
 cbde list                            # what's installed, what's active
-cbde ghc                             # which GHC am I using?
-cbde ghc 9.6.6                       # install if needed, then switch
+cbde ghc                             # which GHC am I using, and says who chose it
+cbde ghc 9.6.6                       # install if needed, then switch this project (.cbde, commit it)
+cbde ghc 9.6.6 --local               # ... just for you (.cbde.local)
+cbde sync                            # install what the project selects, relink
 cbde cabal-version 3.12.1.0          # same for cabal (note the verb)
 cbde hls                             # language server for the active GHC
 cbde lean                            # which Lean toolchain is active?
@@ -470,8 +474,59 @@ Two version constraints fail confusingly, so both are worth knowing:
 Prefer a TUI? `ghcup tui` is in there too — `cbde` is a convenience layer over
 ghcup, not a replacement for it.
 
-Every switch takes you off the image's verified set and onto a _custom_ one.
-That is allowed; `cbde matrix` and `cbde doctor` just say so. Read on.
+### Per project, and in parallel
+
+The volume only says what is _installed_; every GHC you ever used sits in it
+side by side. Which one is _active_ is decided per container, on every start,
+in three layers, the last that sets a key winning:
+
+1. the image's compatibility matrix (see below);
+2. `.cbde` at the project root: the project's choice, committed. This is
+   where `cbde ghc 9.6.6` records it;
+3. `.cbde.local` beside it: a programmer's own, gitignored. `cbde` only reads
+   it; you create it by hand or with `--local` (which also adds it to
+   `.gitignore`).
+
+```ini
+# .cbde                         # .cbde.local
+matrix=0.2.0                    ghc=9.6.6
+cabal=3.12.1.0
+```
+
+Keys are `ghc`, `cabal` and `hls`, plus `matrix` for the image (which
+`.cbde.local` may override too). Lean needs none of this: elan already
+follows a project's `lean-toolchain` file.
+
+The result is a directory of symlinks into the volume, first on `PATH`, that
+lives in the container rather than the volume. So two projects building at the
+same time on one volume each see their own GHC, and a switch in one relinks
+that container only. Outside a project the links are simply the matrix's, and
+there is nothing to switch: the toolchain is the same everywhere unless a
+project's files say otherwise. Installs into the shared volume take a lock,
+so two containers asking for the same new version download it once.
+
+The links cover the unversioned names (`ghc`, `cabal`, …) and the selected
+GHC's own versioned ones. A `cabal.project` that says `with-compiler: ghc-9.6.6`
+asks for that name, not for `ghc`, and gets it whenever 9.6.6 is in the
+volume, whatever `.cbde` selects; override it with `cabal build -w ghc-9.6.7`
+or a `cabal.project.local`.
+
+A version the project selects but the volume lacks (a start with no network,
+say) is not silently replaced by another: `ghc` then says which version is
+missing and to run `cbde sync`. In VS Code, the devcontainer re-reads both
+files on every start; after a teammate changes `.cbde` mid-session, run
+`cbde sync`.
+
+`cbde ghc 9.6.7` when 9.6.7 is what the layer below gives removes the key
+rather than recording it, so switching back leaves no redundant pin.
+`cbde matrix reset` drops `ghc`, `cabal` and `hls` from `.cbde` (its
+`matrix=` stays), and says what a `.cbde.local` still selects; it never edits
+that file.
+
+A switch takes you off the image's verified set. That is allowed, and
+`cbde matrix` and `cbde doctor` tell the two cases apart: **declared** when
+every difference is one the project's files ask for, **custom** when not.
+Read on.
 
 ## Compatibility matrices
 
@@ -505,8 +560,9 @@ Compatibility matrix 0.2.0 (this image)
   ✓ verified: the active toolchain is exactly matrix 0.2.0
 ```
 
-After `cbde ghc 9.6.6` the same command reports **custom**, names the
-component that differs, and offers `cbde matrix reset`, which reinstalls or
+After `cbde ghc 9.6.6` the same command reports **declared** (the project's
+`.cbde` asks for it) and names the component and file; a difference no
+file explains is **custom**. Either way `cbde matrix reset` reinstalls or
 reselects whatever the matrix pins. GHC, cabal and Lean come back from the
 image's own installers, so a reset — or a wiped volume — needs no network for
 them.
@@ -540,7 +596,8 @@ the next matrix ships. Offline you still see everything local.
 
 The pin is one line, `matrix=0.1.0`, in a `.cbde` file at the project root.
 Commit it. From then on every `cbde …` command in that project runs
-`cbde:0.1.0`, `cbde build` builds that matrix, and `.devcontainer/devcontainer.json`
+`cbde:0.1.0`, pulling it from the registry on first use when it is not here
+(a teammate's fresh clone just works; `CBDE_PULL=never` turns that off), `cbde build` builds that matrix, and `.devcontainer/devcontainer.json`
 points VS Code at the same image. `CBDE_IMAGE` still overrides everything when
 set, which `cbde info` will tell you.
 
@@ -764,7 +821,7 @@ Everything below is for people changing CBDE itself. Users never need it.
 | `Dockerfile` | the image, in stages: crypto libs, `base`, `toolchain` (also builds the seed), plustan, aiken, Blaster, `final` |
 | `matrices/<version>.env` | one compatibility matrix per file: the single source of every pin |
 | `templates/devcontainer.json` | the dev-container template copied into the image; `cbde devcontainer` writes it into user projects |
-| `lib/matrix.sh` | matrix reading and validation, the `active_*` probes, and the seeded installers (`ghcup_install`, `lean_install`, `cabal_index_install`) |
+| `lib/matrix.sh` | matrix reading and validation, the `active_*` probes, per-project selection (`.cbde` / `.cbde.local`, `active_link`), and the seeded installers (`ghcup_install`, `lean_install`, `cabal_index_install`) |
 | `bin/cbde` | the host launcher: `docker run` wrapper, pins, `matrix`, `registry`, `build`, `pull` |
 | `install.sh` | the `curl \| sh` installer: copies `bin/cbde` to `~/.local/bin`, or with `--try` opens a shell where `cbde` is a function |
 | `cbde` | the in-container CLI: version switching, `matrix`, `doctor`, `devcontainer` |
@@ -955,7 +1012,10 @@ docker volume rm cbde-scratch
 ```
 
 Every line must say "from the image (no download)" and the verdict must be
-"verified".
+"verified". After touching project selection, also run two containers at
+once on the same scratch volume with two project mounts, one of them with a
+`.cbde.local` selecting another GHC: each must report its own
+`ghc --numeric-version` while the other switches.
 
 ### Conventions
 
@@ -982,6 +1042,8 @@ Every line must say "from the image (no download)" and the verdict must be
 | `CBDE_UID` / `CBDE_GID` | _(from the mount)_         | user to run as; overrides detection                                   |
 | `CBDE_SKIP_PROVISION`   | —                          | `1` skips provisioning entirely (CI)                                  |
 | `CBDE_FORCE_PROVISION`  | —                          | `1` provisions even with no volume mounted                            |
+| `CBDE_PROJECT`          | `/workspace`               | where the project (and its `.cbde` / `.cbde.local`) is                |
+| `CBDE_ACTIVE_BIN`       | `/root/.local/share/cbde/bin` | this container's links to the project's toolchain, first on `PATH` |
 
 Launcher-side (host):
 
@@ -992,6 +1054,7 @@ Launcher-side (host):
 | `CBDE_PLATFORM`    | _(native)_    | force a platform on `docker run`/`pull`/`build`, e.g. `linux/amd64` on Apple Silicon (emulated) |
 | `CBDE_REGISTRY`    | `ghcr.io/input-output-hk/cbde`, or `registry=` in `~/.config/cbde/config` | where `cbde pull` fetches from |
 | `CBDE_DOCKER_ARGS` | —             | extra `docker run` flags, e.g. `'-p 8080:8080 -v ~/data:/data'` |
+| `CBDE_PULL`        | —             | `never`: a pinned project whose image is missing fails instead of pulling it |
 
 ### Launcher commands
 
@@ -1002,7 +1065,8 @@ Launcher-side (host):
 | `cbde run <cmd> …`                            | same, explicit — use when `<cmd>` collides with a verb below |
 | `cbde nix <cmd> …`                            | run inside `nix develop`                                     |
 | `cbde list` / `doctor` / `update`             | forwarded to the in-container `cbde`                         |
-| `cbde ghc` / `hls` / `lean` / `cabal-version` | version switching                                            |
+| `cbde ghc` / `hls` / `lean` / `cabal-version` | version switching, recorded in the project's `.cbde` (`--local`: `.cbde.local`) |
+| `cbde sync`                                   | install what this project's `.cbde` / `.cbde.local` select, relink |
 | `cbde matrix [list\|reset]`                   | which compatibility matrix runs here, verified or custom     |
 | `cbde matrix <name>` / `unpin`                | pin this project to matrix `<name>` (pulls `cbde:<name>`), or stop |
 | `cbde devcontainer`                           | write `.devcontainer/devcontainer.json` here                 |

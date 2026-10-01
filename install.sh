@@ -143,9 +143,13 @@ EOF
 
 # Under `curl | sh` stdin is the pipe, not the terminal; an interactive shell
 # reading from it would exit at once. Reattach to the tty when there is one.
+# CBDE_TTY replaces /dev/tty for the tests: run from a terminal, an
+# interactive shell on the real tty waits there for input, invisible because
+# the test captures its output, and holds the foreground so Ctrl+C is lost.
 run_shell() {
+  tty="${CBDE_TTY:-/dev/tty}"
   if [ -t 0 ]; then "$@" || true
-  elif (exec </dev/tty) 2>/dev/null; then "$@" </dev/tty || true
+  elif (exec <"$tty") 2>/dev/null; then "$@" <"$tty" || true
   else "$@" || true
   fi
 }

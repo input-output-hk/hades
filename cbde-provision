@@ -174,6 +174,37 @@ if [ ! -e "$GHCUP_BINDIR/ghc" ] && ghc_installed "$CBDE_GHC"; then
 fi
 
 # ---------------------------------------------------------------------------
+# This project's toolchain
+# ---------------------------------------------------------------------------
+# Whatever the project's .cbde / .cbde.local select on top of the matrix is
+# installed into the shared volume (never `set`: the global selection is not
+# the project's), then linked into this container's own bin dir, first on
+# PATH. Every start re-resolves, so the matrix wins unless the project says
+# otherwise, and a parallel container on another project is unaffected.
+PROJECT_ROOT="$(project_root_here)"
+if [ -n "$PROJECT_ROOT" ]; then
+  if [ -n "$(project_summary "$PROJECT_ROOT")" ]; then
+    log "project toolchain: $(project_summary "$PROJECT_ROOT" | tr '\n' ',' | sed 's/,$//; s/,/, /g')"
+  fi
+  want="$(selected_version "$PROJECT_ROOT" ghc)"
+  if [ -n "$want" ] && ! ghc_installed "$want"; then
+    banner; log "installing GHC $want for this project"
+    retry ghcup_install ghc "$want" || warn "GHC $want is not installed; 'ghc' will say so."
+  fi
+  want="$(selected_version "$PROJECT_ROOT" cabal)"
+  if [ -n "$want" ] && ! cabal_installed "$want"; then
+    banner; log "installing cabal $want for this project"
+    retry ghcup_install cabal "$want" || warn "cabal $want is not installed; 'cabal' will say so."
+  fi
+  want="$(selected_version "$PROJECT_ROOT" hls)"
+  if [ -n "$want" ] && ! hls_installed "$want"; then
+    banner; log "installing HLS $want for this project"
+    retry ghcup install hls "$want" || warn "HLS $want is not installed."
+  fi
+fi
+active_link "$PROJECT_ROOT" || warn "could not link the project toolchain into $CBDE_ACTIVE_BIN"
+
+# ---------------------------------------------------------------------------
 # The Lean toolchain (for Blaster)
 # ---------------------------------------------------------------------------
 # CBDE_LEAN is set only in the final image, so build stages skip this. Set it

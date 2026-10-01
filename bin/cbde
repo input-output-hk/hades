@@ -36,16 +36,26 @@ project_root() {
 # A project may pin the compatibility matrix it was written against in a
 # `.cbde` file at its root (`matrix=0.2.0`); the launcher then runs the image
 # of that matrix, cbde:0.2.0, instead of cbde:latest. Written by `cbde matrix`.
+# The same file may select other toolchain versions (ghc=, cabal=, hls=),
+# which the container reads. `.cbde.local` beside it is the personal,
+# gitignored layer and wins, for matrix= too.
 PIN_FILE=.cbde
+LOCAL_FILE=.cbde.local
 matrix_name_ok() { case "$1" in ''|.*|*[!A-Za-z0-9._-]*) return 1 ;; *) return 0 ;; esac; }
-project_matrix() {
-  [ -f "$1/$PIN_FILE" ] || return 0
-  sed -n 's/^[[:space:]]*matrix[[:space:]]*=[[:space:]]*//p' "$1/$PIN_FILE" | head -n 1 | tr -d '[:space:]'
+pin_in() { # FILE -> its matrix= value, or nothing
+  [ -f "$1" ] || return 0
+  sed -n 's/^[[:space:]]*matrix[[:space:]]*=[[:space:]]*//p' "$1" | head -n 1 | tr -d '[:space:]'
 }
+project_matrix() {
+  local v; v="$(pin_in "$1/$LOCAL_FILE")"
+  [ -n "$v" ] || v="$(pin_in "$1/$PIN_FILE")"
+  printf '%s' "$v"
+}
+pin_source() { [ -n "$(pin_in "$1/$LOCAL_FILE")" ] && printf '%s' "$LOCAL_FILE" || printf '%s' "$PIN_FILE"; }
 
 ROOT="$(project_root)"
 PIN="$(project_matrix "$ROOT")"
-[ -z "$PIN" ] || matrix_name_ok "$PIN" || die "invalid matrix name in $ROOT/$PIN_FILE: $PIN"
+[ -z "$PIN" ] || matrix_name_ok "$PIN" || die "invalid matrix name in $ROOT/$(pin_source "$ROOT"): $PIN"
 
 # Per-user settings, so an override survives shells and sessions without an
 # export: ~/.config/cbde/config, `key=value` lines (registry, volume,
@@ -111,9 +121,11 @@ Toolchain (forwarded to cbde inside the container):
   cbde matrix list            every matrix: local images and the registry's tags
   cbde matrix <name>          pin this project to matrix <name> (pulls cbde:<name> if needed)
   cbde matrix unpin           back to cbde:latest
-  cbde ghc [version]          show or switch GHC
-  cbde cabal-version [v]      show or switch cabal
-  cbde hls [version]          install the language server
+  cbde ghc [version]          show or switch GHC for this project (.cbde, commit it;
+                              --local: .cbde.local, just you)
+  cbde cabal-version [v]      show or switch cabal (same flags)
+  cbde hls [version]          install the language server (same flags)
+  cbde sync                   install what this project's .cbde/.cbde.local select
   cbde lean [toolchain]       show or switch the Lean toolchain
   cbde devcontainer [--force] write .devcontainer/devcontainer.json here
   cbde update                 refresh ghcup release metadata
@@ -159,9 +171,41 @@ workdir_in_container() {
 
 image_present() { docker image inspect "$IMAGE" >/dev/null 2>&1; }
 
+# Six random lower-case letters and digits, from $RANDOM: no pipe, so no
+# SIGPIPE to trip pipefail.
+rand_suffix() {
+  local c=abcdefghijklmnopqrstuvwxyz0123456789 s= i
+  for i in 1 2 3 4 5 6; do s="$s${c:$((RANDOM % 36)):1}"; done
+  printf '%s' "$s"
+}
+
+# cbde-<matrix>-<suffix>, e.g. cbde-0.2.0-k3x9q2, so `docker ps` says which
+# matrix each container runs. The version comes from the image itself
+# (cbde:latest is some matrix too); an image without one falls back to its
+# tag. Anything docker would refuse in a name becomes '-'.
+container_name() {
+  local v t
+  v="$(image_version "$IMAGE")"
+  if [ -z "$v" ]; then
+    t="${IMAGE##*/}"
+    case "$t" in *:*) v="${t##*:}" ;; *) v=latest ;; esac
+  fi
+  v="$(printf '%s' "$v" | tr -c 'A-Za-z0-9_.-' '-')"
+  printf 'cbde-%s-%s' "$v" "$(rand_suffix)"
+}
+
 docker_run() {
   have_docker
-  image_present || die "image $IMAGE not found — run 'cbde pull${PIN:+ $PIN}' or 'cbde build${PIN:+ --matrix $PIN}'"
+  if ! image_present; then
+    # A project's pin is binding on first use: a fresh clone pinned to 0.1.0
+    # fetches cbde:0.1.0 like `cbde matrix 0.1.0` would (without rewriting
+    # any file). An explicit CBDE_IMAGE is taken literally; CBDE_PULL=never
+    # keeps runs from downloading at all.
+    if [ -n "$PIN" ] && [ -z "${CBDE_IMAGE:-}" ] && [ "${CBDE_PULL:-}" != never ]; then
+      fetch_matrix_image "$PIN"
+    fi
+    image_present || die "image $IMAGE not found — run 'cbde pull${PIN:+ $PIN}' or 'cbde build${PIN:+ --matrix $PIN}'"
+  fi
 
   local root="$ROOT"
   local wd;   wd="$(workdir_in_container "$root")"
@@ -182,6 +226,12 @@ docker_run() {
 
   local extra=()
   [ -n "${CBDE_DOCKER_ARGS:-}" ] && read -r -a extra <<<"$CBDE_DOCKER_ARGS"
+
+  # A --name of your own in CBDE_DOCKER_ARGS wins.
+  case " ${CBDE_DOCKER_ARGS:-} " in
+    *" --name "*|*" --name="*) ;;
+    *) flags+=(--name "$(container_name)") ;;
+  esac
 
   exec docker run "${flags[@]}" \
     -v "$VOLUME:/nix" \
@@ -276,20 +326,27 @@ devcontainer_follow() { # NAME: point .devcontainer/devcontainer.json's image at
   printf 'cbde: .devcontainer/devcontainer.json now uses cbde:%s\n' "$1" >&2
 }
 
+# NAME: pull $REGISTRY:NAME and give it its local names, for a matrix image
+# that is not here. Pull progress goes to stderr, so `cbde run ... > file`
+# gets only the command's own output.
+fetch_matrix_image() {
+  local name="$1" ref="$REGISTRY:$1"
+  note "cbde: cbde:$name is not here yet — pulling $ref (~1.2 GB, once)"
+  docker pull ${PLATFORM:+--platform "$PLATFORM"} "$ref" >&2 \
+    || die "could not pull $ref. From a checkout you can build it: cbde build --matrix $name"
+  tag_locally "$ref" "$name"
+}
+
 pin_matrix() {
-  local name="$1" ref
+  local name="$1"
   matrix_name_ok "$name" || die "invalid matrix name: $name"
   have_docker
-  if ! docker image inspect "cbde:$name" >/dev/null 2>&1; then
-    ref="$REGISTRY:$name"
-    note "cbde: cbde:$name is not here yet — pulling $ref"
-    docker pull ${PLATFORM:+--platform "$PLATFORM"} "$ref" \
-      || die "could not pull $ref. From a checkout you can build it: cbde build --matrix $name"
-    tag_locally "$ref" "$name"
-  fi
+  docker image inspect "cbde:$name" >/dev/null 2>&1 || fetch_matrix_image "$name"
   write_pin "$name"
   devcontainer_follow "$name"
   printf 'cbde: project %s pinned to matrix %s (image cbde:%s) in %s\n' "$ROOT" "$name" "$name" "$PIN_FILE" >&2
+  local mine; mine="$(pin_in "$ROOT/$LOCAL_FILE")"
+  [ -z "$mine" ] || [ "$mine" = "$name" ] || note "cbde: your $LOCAL_FILE still says matrix=$mine, which wins for you"
   [ -z "${CBDE_IMAGE:-}" ] || note "cbde: note that CBDE_IMAGE=$CBDE_IMAGE overrides the pin while it is set"
 }
 
@@ -641,7 +698,7 @@ cmd_matrix() {
   case "$sub" in
     show|status)
       printf 'project    %s\n' "$ROOT"
-      if [ -n "$PIN" ]; then printf 'pinned     matrix %s   (%s)\n' "$PIN" "$PIN_FILE"
+      if [ -n "$PIN" ]; then printf 'pinned     matrix %s   (%s)\n' "$PIN" "$(pin_source "$ROOT")"
       else printf 'pinned     none — running cbde:latest (pin with: cbde matrix <name>)\n'; fi
       [ -z "${CBDE_IMAGE:-}" ] || printf 'override   CBDE_IMAGE=%s\n' "$CBDE_IMAGE"
       printf 'image      %s%s\n' "$IMAGE" "$(image_present || printf '  (not pulled)')"
@@ -746,7 +803,7 @@ case "${1:-shell}" in
 
   # Forwarded to the in-container cbde. 'cabal' alone is a tool, so the version
   # switcher is spelled cabal-version here to keep 'cbde cabal build' working.
-  list|doctor|update|devcontainer|ghc|hls|lean)
+  list|doctor|update|devcontainer|ghc|hls|lean|sync)
                        docker_run cbde "$@" ;;
   cabal-version)       shift; docker_run cbde cabal "$@" ;;
 

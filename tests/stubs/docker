@@ -2,6 +2,7 @@
 # Fake docker for the launcher tests. Logs every call to $STUB_LOG and answers
 # the few queries the launcher makes:
 #   STUB_IMAGES         space-separated refs that `image inspect` reports present
+#                       (as is any ref an earlier `docker tag` in this log created)
 #   STUB_IMAGE_VERSION  CBDE_IMAGE_VERSION that `image inspect -f` reports
 #   STUB_PULL_FAIL      set to make `docker pull` fail
 #   STUB_CONTAINERS     names `container inspect` reports (append :stopped for a stopped one)
@@ -26,7 +27,10 @@ case "${1:-} ${2:-}" in
         printf 'PATH=/usr/bin\nCBDE_IMAGE_VERSION=%s\nCBDE_GHC=%s\nCBDE_CABAL=3.10.3.0\nCBDE_LEAN=leanprover/lean4:v4.24.0\n' "$v" "$ghc"
         exit 0 ;;
     esac
-    case " ${STUB_IMAGES:-} " in *" $ref "*) exit 0 ;; *) exit 1 ;; esac ;;
+    case " ${STUB_IMAGES:-} " in *" $ref "*) exit 0 ;; esac
+    # Also present once this run has tagged it (after a pull, say).
+    grep -q "^docker tag .* $ref\$" "$STUB_LOG" && exit 0
+    exit 1 ;;
   "container inspect")
     for ref; do :; done
     case " ${STUB_CONTAINERS:-} " in
@@ -36,7 +40,8 @@ case "${1:-} ${2:-}" in
     esac ;;
   "images "*) printf '%s\n' ${STUB_TAGS-0.2.0 latest} ;;
   "exec "*) exit 0 ;;
-  "pull "*) [ -z "${STUB_PULL_FAIL:-}" ] || { echo "stub: pull failed" >&2; exit 1; } ;;
+  "pull "*) [ -z "${STUB_PULL_FAIL:-}" ] || { echo "stub: pull failed" >&2; exit 1; }
+            echo "stub: pull progress on stdout, as docker does" ;;
   "volume inspect") exit 1 ;;
   "buildx imagetools")
     for ref; do :; done
