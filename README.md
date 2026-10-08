@@ -23,13 +23,8 @@ Those run in the container against the project in your current directory. No
 
 ## Install
 
-> 🚧 **Testing phase.** The installer is on the `feat/curl-install` branch,
-> and the lines below fetch it from there. When it is merged, `feat/curl-install`
-> becomes `main` in both places and `CBDE_REF=` goes away.
-
 ```bash
-curl -fsSL https://raw.githubusercontent.com/input-output-hk/hades/feat/curl-install/install.sh \
-  | CBDE_REF=feat/curl-install sh
+curl -fsSL https://raw.githubusercontent.com/input-output-hk/hades/main/install.sh | sh
 ```
 
 That drops the `cbde` launcher into `~/.local/bin` (or `$CBDE_INSTALL_DIR`,
@@ -45,8 +40,7 @@ Running the same line again updates the launcher in place.
 ### Try it without installing
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/input-output-hk/hades/feat/curl-install/install.sh \
-  | CBDE_REF=feat/curl-install sh -s -- --try
+curl -fsSL https://raw.githubusercontent.com/input-output-hk/hades/main/install.sh | sh -s -- --try
 ```
 
 This opens your usual shell (bash, zsh or fish) with `cbde` defined as a shell

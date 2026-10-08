@@ -129,11 +129,10 @@ and `cbde registry status` are the sources.
   with shared volumes; downgrade or drop.
 - Nix is not pinned in the matrix; its store path is shared via the volume.
 - `cbde update` name collides with the PRD's meaning; rename pending.
-- `install.sh` defaults to `input-output-hk/hades@main` (public). README's
-  Install section deliberately carries the `feat/curl-install` URLs +
-  `CBDE_REF=feat/curl-install` so testers can copy-paste; **before merging to
-  main, change both back to `main` and drop `CBDE_REF=`** (grep
-  `feat/curl-install` in README.md).
+- `install.sh` defaults to `input-output-hk/hades@main` (public) and the
+  README's Install section fetches from `main`. To test an unmerged branch
+  use the `feat/x` recipe under "Testing the installer" in README.md; never
+  leave a branch name in the Install section.
 - Testers running `cbde doctor` will hit `ghcr.io/input-output-hk/cbde:latest`,
   which does not exist yet: nothing is published. Either publish first or tell
   them to build from a checkout.
