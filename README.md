@@ -1,4 +1,4 @@
-# CBDE — Container Based Development Environment
+# Hades — High Assurance Developer Environment
 
 Every Cardano smart-contract tool, in one container, without installing a
 compiler on your machine. You need Docker. That is the whole prerequisite list.
